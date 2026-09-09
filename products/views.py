@@ -14,6 +14,7 @@ from django.db.models.functions import TruncMonth, TruncDay
 from django.utils import timezone
 from datetime import timedelta
 
+
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
