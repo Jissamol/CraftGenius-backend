@@ -11,7 +11,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CustomUser
-        fields = ['name', 'email', 'password', 'role']
+        fields = ['name', 'email', 'password', 'role', 'address', 'phone_number', 'profile_picture']
 
     def create(self, validated_data):
         role = validated_data.get('role')
@@ -27,11 +27,14 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data['password'],
             name=validated_data['name'],
             role=validated_data['role'],
-            is_approved=validated_data['is_approved']
+            is_approved=validated_data['is_approved'],
+            address=validated_data.get('address'),
+            phone_number=validated_data.get('phone_number'),
+            profile_picture=validated_data.get('profile_picture')
         )
         return user
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomUser
-        fields = ['id', 'name', 'email', 'role', 'is_approved']
+        fields = ['id', 'name', 'email', 'role', 'is_approved', 'address', 'phone_number', 'profile_picture']
