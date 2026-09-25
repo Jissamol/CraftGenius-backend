@@ -120,12 +120,27 @@ class ReviewReplySerializer(serializers.Serializer):
 class SellerProfileSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='user.name', read_only=True)
     email = serializers.CharField(source='user.email', read_only=True)
+    phone_number = serializers.CharField(source='user.phone_number', read_only=True)
+    address = serializers.CharField(source='user.address', read_only=True)
+    role = serializers.CharField(source='user.role', read_only=True)
+    is_approved = serializers.BooleanField(source='user.is_approved', read_only=True)
+
+    # Use the user's profile picture if the seller profile doesn't have one
+    def get_profile_picture(self, obj):
+        request = self.context.get('request')
+        if obj.profile_picture:
+            return request.build_absolute_uri(obj.profile_picture.url) if request else obj.profile_picture.url
+        elif obj.user.profile_picture:
+            return request.build_absolute_uri(obj.user.profile_picture.url) if request else obj.user.profile_picture.url
+        return None
+
+    profile_picture_url = serializers.SerializerMethodField(method_name='get_profile_picture')
 
     class Meta:
         model = SellerProfile
         fields = [
-            'id', 'name', 'email', 'bio', 'profile_picture',
-            'craft_specialty', 'location', 'social_links',
+            'id', 'name', 'email', 'phone_number', 'address', 'role', 'is_approved',
+            'bio', 'profile_picture', 'profile_picture_url', 'craft_specialty', 'location', 'social_links',
             'created_at', 'updated_at'
         ]
 
