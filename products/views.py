@@ -228,7 +228,23 @@ def seller_profile(request):
     serializer = SellerProfileSerializer(profile, data=request.data, partial=True, context={'request': request})
     if serializer.is_valid():
         serializer.save()
-        return Response(serializer.data)
+        
+        # Update nested user fields if provided
+        user = request.user
+        user_updated = False
+        if 'phone_number' in request.data:
+            user.phone_number = request.data['phone_number']
+            user_updated = True
+        if 'address' in request.data:
+            user.address = request.data['address']
+            user_updated = True
+        if 'name' in request.data:
+            user.name = request.data['name']
+            user_updated = True
+        if user_updated:
+            user.save()
+            
+        return Response(SellerProfileSerializer(profile, context={'request': request}).data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
