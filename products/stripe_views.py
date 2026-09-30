@@ -5,7 +5,8 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from .models import Product, Order
+from .models import Product, Order, CommissionSetting, Earning
+from decimal import Decimal
 import os
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -151,6 +152,22 @@ def stripe_webhook(request):
                 order.stripe_payment_intent = payment_intent
                 order.save()
                 
+                # Calculate and create Earning
+                commission_rate = CommissionSetting.get_rate()
+                commission = (order.total_amount * commission_rate) / Decimal('100.00')
+                net_amount = order.total_amount - commission
+                
+                Earning.objects.get_or_create(
+                    order=order,
+                    defaults={
+                        'seller': order.seller,
+                        'amount': order.total_amount,
+                        'commission': commission,
+                        'net_amount': net_amount,
+                        'status': 'PENDING'
+                    }
+                )
+                
                 # Reduce stock
                 product = order.product
                 product.stock -= order.quantity
@@ -163,6 +180,18 @@ def stripe_webhook(request):
                 
         except Exception as e:
             print(f"Error processing webhook for session {session_id}: {e}")
+
+    elif event['type'] in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
+        session = event['data']['object']
+        session_id = getattr(session, 'id', None)
+        
+        try:
+            orders = Order.objects.filter(stripe_session_id=session_id, is_paid=False)
+            for order in orders:
+                order.status = 'FAILED'
+                order.save()
+        except Exception as e:
+            print(f"Error processing failed webhook for session {session_id}: {e}")
 
     return HttpResponse(status=200)
 
@@ -187,6 +216,22 @@ def payment_success_view(request):
                     order.status = 'PROCESSING'
                     order.stripe_payment_intent = session.payment_intent
                     order.save()
+                    
+                    # Calculate and create Earning
+                    commission_rate = CommissionSetting.get_rate()
+                    commission = (order.total_amount * commission_rate) / Decimal('100.00')
+                    net_amount = order.total_amount - commission
+                    
+                    Earning.objects.get_or_create(
+                        order=order,
+                        defaults={
+                            'seller': order.seller,
+                            'amount': order.total_amount,
+                            'commission': commission,
+                            'net_amount': net_amount,
+                            'status': 'PENDING'
+                        }
+                    )
                     
                     # Stock reduction (atomicity check)
                     product = order.product
