@@ -86,6 +86,11 @@ class Order(models.Model):
         ('SHIPPED', 'Shipped'),
         ('DELIVERED', 'Delivered'),
         ('CANCELLED', 'Cancelled'),
+        ('FAILED', 'Failed Payment'),
+        ('REFUNDED', 'Refunded'),
+        ('RETURN_REQUESTED', 'Return Requested'),
+        ('RETURNED', 'Returned'),
+        ('DISPUTED', 'Disputed'),
     )
 
     customer = models.ForeignKey(
