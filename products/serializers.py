@@ -25,6 +25,7 @@ class ProductSerializer(serializers.ModelSerializer):
     average_rating = serializers.FloatField(read_only=True)
     total_orders = serializers.IntegerField(read_only=True)
     primary_image_url = serializers.SerializerMethodField()
+    recommendation_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -32,7 +33,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'id', 'name', 'description', 'category', 'category_name',
             'price', 'stock', 'tags', 'is_active', 'images',
             'primary_image_url', 'seller_name', 'average_rating',
-            'total_orders', 'created_at', 'updated_at'
+            'total_orders', 'recommendation_reason', 'created_at', 'updated_at'
         ]
         read_only_fields = ['seller']
 
@@ -44,6 +45,9 @@ class ProductSerializer(serializers.ModelSerializer):
                 return request.build_absolute_uri(img.image.url)
             return img.image.url
         return None
+
+    def get_recommendation_reason(self, obj):
+        return getattr(obj, 'recommendation_reason', None)
 
 
 class ProductCreateSerializer(serializers.ModelSerializer):

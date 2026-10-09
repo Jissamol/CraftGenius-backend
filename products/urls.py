@@ -41,6 +41,7 @@ urlpatterns = [
     # Product Browse
     path('products/', views.product_list, name='product-list'),
     path('products/<int:pk>/', views.product_detail, name='product-detail'),
+    path('products/<int:pk>/track-view/', views.track_product_view, name='track-product-view'),
     path('products/image-search/', views.product_image_search, name='product-image-search'),
 
     # Cart
@@ -70,6 +71,7 @@ urlpatterns = [
 
     # Recommendations
     path('recommendations/', views.recommendations, name='recommendations'),
+    path('recommendations/interests/', views.user_category_interests, name='user-category-interests'),
 
     # AI Chat Assistant
     path('chat/', views.chat_assistant, name='chat-assistant'),

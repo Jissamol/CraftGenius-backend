@@ -372,3 +372,47 @@ class ProductEmbedding(models.Model):
     def __str__(self):
         return f"Embedding for {self.product.name}"
 
+
+class BrowsingHistory(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='browsing_history'
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name='browsed_by'
+    )
+    view_count = models.PositiveIntegerField(default=1)
+    last_viewed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-last_viewed_at']
+        unique_together = ('user', 'product')
+
+    def __str__(self):
+        return f"{self.user.name} viewed {self.product.name} ({self.view_count}x)"
+
+
+class UserCategoryInterest(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='category_interests'
+    )
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.CASCADE,
+        related_name='interested_users'
+    )
+    score = models.FloatField(default=1.0, help_text="Interest affinity score (updated from browsing/explicit)")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-score']
+        unique_together = ('user', 'category')
+
+    def __str__(self):
+        return f"{self.user.name} interest in {self.category.name}: {self.score}"
+
