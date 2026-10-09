@@ -6,6 +6,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from .models import Product, Order, CommissionSetting, Earning
+from .recommendation_engine import boost_category_interest
 from decimal import Decimal
 import os
 
@@ -87,6 +88,8 @@ def create_checkout_session(request):
                 is_paid=False,
                 stripe_session_id=checkout_session.id
             )
+            if product.category:
+                boost_category_interest(request.user, product.category, points=4.0)
         else:
             # Re-read cart items to create orders
             from .models import Cart
@@ -102,6 +105,8 @@ def create_checkout_session(request):
                     is_paid=False,
                     stripe_session_id=checkout_session.id
                 )
+                if item.product.category:
+                    boost_category_interest(request.user, item.product.category, points=4.0)
             # We DON'T clear the cart yet. We clear it in the webhook or on success page confirmation.
 
         return Response({'url': checkout_session.url, 'id': checkout_session.id})

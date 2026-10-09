@@ -18,7 +18,10 @@ from datetime import timedelta
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
-    CommissionSetting, ProductEmbedding
+    CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest
+)
+from .recommendation_engine import (
+    RecommendationEngine, record_product_view, boost_category_interest
 )
 from .serializers import (
     CategorySerializer, ProductSerializer, ProductCreateSerializer,
@@ -488,7 +491,7 @@ def product_list(request):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def product_detail(request, pk):
     """Full product detail with images, reviews, seller info."""
     try:
@@ -496,8 +499,24 @@ def product_detail(request, pk):
     except Product.DoesNotExist:
         return Response({'detail': 'Product not found'}, status=status.HTTP_404_NOT_FOUND)
 
+    # Record browsing history and category affinity for personalized AI recommendations
+    if request.user and request.user.is_authenticated:
+        record_product_view(request.user, product)
+
     serializer = ProductDetailSerializer(product, context={'request': request})
     return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def track_product_view(request, pk):
+    """Explicitly track a product interaction or view."""
+    try:
+        product = Product.objects.get(pk=pk, is_active=True)
+        record_product_view(request.user, product)
+        return Response({'status': 'view recorded', 'product_id': pk})
+    except Product.DoesNotExist:
+        return Response({'detail': 'Product not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 # ──────────────────────────── Cart ──────────────────────────────
@@ -532,6 +551,9 @@ def add_to_cart(request):
     else:
         item.quantity = quantity
     item.save()
+
+    if product.category:
+        boost_category_interest(request.user, product.category, points=1.5)
 
     serializer = CartSerializer(cart, context={'request': request})
     return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -605,6 +627,8 @@ def create_order(request):
         item.product.save()
 
         orders_created.append(order)
+        if item.product.category:
+            boost_category_interest(request.user, item.product.category, points=4.0)
 
     # Clear cart
     items.delete()
@@ -670,6 +694,9 @@ def add_to_wishlist(request):
     _, created = Wishlist.objects.get_or_create(user=request.user, product=product)
     if not created:
         return Response({'detail': 'Already in wishlist'}, status=status.HTTP_200_OK)
+
+    if product.category:
+        boost_category_interest(request.user, product.category, points=2.5)
 
     return Response({'detail': 'Added to wishlist'}, status=status.HTTP_201_CREATED)
 
@@ -788,43 +815,19 @@ def customer_profile(request):
 # ──────────────────────────── Recommendations ───────────────────
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def recommendations(request):
-    """AI-based recommendations: personalized, trending, similar."""
-    user = request.user
+    """
+    AI-powered personalized recommendations:
+    - Multi-signal personalized ranking (browsing, wishlist, purchases, category interests)
+    - Vector embeddings semantic similarity
+    - Dynamic contextual explanations (e.g., 'Recommended because you like handmade pottery.')
+    - Intelligent cold-start fallback recommendations for new users
+    """
+    user = request.user if (request.user and request.user.is_authenticated) else None
 
-    # Products the user has ordered or has in wishlist
-    ordered_product_ids = Order.objects.filter(customer=user).values_list('product_id', flat=True)
-    wishlist_product_ids = Wishlist.objects.filter(user=user).values_list('product_id', flat=True)
-    
-    combined_product_ids = list(ordered_product_ids) + list(wishlist_product_ids)
-
-    # Get categories the user is interested in
-    interest_categories = Product.objects.filter(
-        id__in=combined_product_ids
-    ).values_list('category_id', flat=True).distinct()
-
-    # Recommended: categories of interest, excluding what they already have/bought
-    recommended = Product.objects.filter(
-        is_active=True, 
-        category_id__in=interest_categories
-    ).exclude(id__in=combined_product_ids).order_by('-created_at')[:12]
-
-    # Fallback for new users: Show top rated products
-    if recommended.count() < 4:
-        top_rated = Product.objects.filter(is_active=True).annotate(
-            avg_rating=Avg('reviews__rating')
-        ).exclude(id__in=combined_product_ids).order_by('-avg_rating', '-created_at')[:12]
-        
-        # Combine and remove duplicates
-        recommended_list = list(recommended)
-        existing_ids = {p.id for p in recommended_list}
-        for p in top_rated:
-            if p.id not in existing_ids:
-                recommended_list.append(p)
-                if len(recommended_list) >= 12:
-                    break
-        recommended = recommended_list[:12]
+    # Intelligent personalized recommendations with explanations
+    recommended = RecommendationEngine.get_personalized_recommendations(user, limit=12)
 
     # Trending: most ordered in last 30 days
     thirty_days_ago = timezone.now() - timedelta(days=30)
@@ -833,23 +836,21 @@ def recommendations(request):
     ).values('product_id').annotate(
         count=Count('id')
     ).order_by('-count').values_list('product_id', flat=True)[:12]
-    
-    trending = Product.objects.filter(id__in=trending_ids, is_active=True)
+
+    trending = list(Product.objects.filter(id__in=trending_ids, is_active=True))
 
     # Fallback for trending: If no recent orders, show products with most total orders
-    if trending.count() < 4:
+    if len(trending) < 4:
         all_time_trending_ids = Order.objects.values('product_id').annotate(
             count=Count('id')
         ).order_by('-count').values_list('product_id', flat=True)[:12]
-        
-        trending = Product.objects.filter(id__in=all_time_trending_ids, is_active=True)
-        
-        # If still empty, show some random active products
-        if trending.count() < 4:
-            trending = Product.objects.filter(is_active=True).order_by('?')[:12]
+        trending = list(Product.objects.filter(id__in=all_time_trending_ids, is_active=True))
+
+        if len(trending) < 4:
+            trending = list(Product.objects.filter(is_active=True).order_by('?')[:12])
 
     # New arrivals
-    new_arrivals = Product.objects.filter(is_active=True).order_by('-created_at')[:12]
+    new_arrivals = list(Product.objects.filter(is_active=True).order_by('-created_at')[:12])
 
     ctx = {'request': request}
     return Response({
@@ -857,6 +858,30 @@ def recommendations(request):
         'trending': ProductSerializer(trending, many=True, context=ctx).data,
         'new_arrivals': ProductSerializer(new_arrivals, many=True, context=ctx).data,
     })
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def user_category_interests(request):
+    """Get or update user category interests."""
+    if request.method == 'GET':
+        interests = UserCategoryInterest.objects.filter(user=request.user).select_related('category')
+        data = [{
+            'category_id': i.category.id,
+            'category_name': i.category.name,
+            'score': i.score
+        } for i in interests]
+        return Response(data)
+
+    elif request.method == 'POST':
+        category_id = request.data.get('category_id')
+        delta = float(request.data.get('delta', 1.0))
+        try:
+            category = Category.objects.get(id=category_id)
+            boost_category_interest(request.user, category, points=delta)
+            return Response({'status': 'updated', 'category_id': category_id})
+        except Category.DoesNotExist:
+            return Response({'detail': 'Category not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 def extract_histogram(image_file):
