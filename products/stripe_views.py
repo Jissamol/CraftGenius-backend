@@ -5,7 +5,7 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from .models import Product, Order, CommissionSetting, Earning, SellerLedgerEntry
+from .models import Product, Order, CommissionSetting, Earning, SellerLedgerEntry, PlatformMonitoringLog
 from .recommendation_engine import boost_category_interest
 from decimal import Decimal
 import os
@@ -146,9 +146,21 @@ def stripe_webhook(request):
         )
     except ValueError as e:
         # Invalid payload
+        PlatformMonitoringLog.record(
+            log_type='WEBHOOK_ERROR',
+            severity='WARNING',
+            source='Stripe Webhook',
+            error_message=f'Invalid webhook payload: {str(e)}'
+        )
         return HttpResponse(status=400)
     except stripe.error.SignatureVerificationError as e:
         # Invalid signature
+        PlatformMonitoringLog.record(
+            log_type='WEBHOOK_ERROR',
+            severity='CRITICAL',
+            source='Stripe Webhook',
+            error_message=f'Signature verification failed: {str(e)}'
+        )
         return HttpResponse(status=400)
 
     # Handle the checkout.session.completed event
@@ -225,6 +237,14 @@ def stripe_webhook(request):
                 
         except Exception as e:
             print(f"Error processing webhook for session {session_id}: {e}")
+            PlatformMonitoringLog.record(
+                log_type='WEBHOOK_ERROR',
+                severity='ERROR',
+                source='Stripe Webhook',
+                error_message=f'Webhook execution failed for session {session_id}: {str(e)}',
+                event_id=session_id or '',
+                payload={'session_id': session_id, 'payment_intent': payment_intent, 'user_id': user_id}
+            )
 
     elif event['type'] in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
         session = event['data']['object']
@@ -232,6 +252,18 @@ def stripe_webhook(request):
         
         try:
             orders = Order.objects.filter(stripe_session_id=session_id, is_paid=False)
+            cust_email = orders.first().customer.email if orders.exists() else ''
+            
+            PlatformMonitoringLog.record(
+                log_type='PAYMENT_FAILURE',
+                severity='WARNING',
+                source='Stripe Webhook',
+                error_message=f"Checkout session {session_id} ended with {event['type']}.",
+                event_id=session_id or '',
+                customer_email=cust_email,
+                payload={'event_type': event['type']}
+            )
+
             for order in orders:
                 order.status = 'FAILED'
                 order.save()
@@ -243,6 +275,13 @@ def stripe_webhook(request):
                 )
         except Exception as e:
             print(f"Error processing failed webhook for session {session_id}: {e}")
+            PlatformMonitoringLog.record(
+                log_type='WEBHOOK_ERROR',
+                severity='ERROR',
+                source='Stripe Webhook',
+                error_message=f'Error processing failed webhook session {session_id}: {str(e)}',
+                event_id=session_id or ''
+            )
 
     return HttpResponse(status=200)
 
@@ -322,6 +361,13 @@ def payment_success_view(request):
                     Cart.objects.get(user=request.user).items.all().delete()
         except Exception as e:
             print(f"Fallback check failed: {e}")
+            PlatformMonitoringLog.record(
+                log_type='GATEWAY_ANOMALY',
+                severity='WARNING',
+                source='Payment Verification',
+                error_message=f'Fallback payment check exception for session {session_id}: {str(e)}',
+                event_id=session_id or ''
+            )
 
     orders = Order.objects.filter(stripe_session_id=session_id, customer=request.user)
     if not orders.filter(is_paid=True).exists():

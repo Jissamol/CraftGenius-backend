@@ -129,4 +129,9 @@ urlpatterns = [
     # Payouts
     path('admin/payouts/', admin_views.admin_payout_list, name='admin-payout-list'),
     path('admin/payouts/<int:pk>/process/', admin_views.admin_process_payout, name='admin-process-payout'),
+
+    # Audit Logs & Platform Monitoring
+    path('admin/audit-logs/', admin_views.admin_audit_logs, name='admin-audit-logs'),
+    path('admin/monitoring/', admin_views.admin_monitoring_logs, name='admin-monitoring-logs'),
+    path('admin/monitoring/<int:pk>/resolve/', admin_views.admin_resolve_monitoring_log, name='admin-resolve-monitoring-log'),
 ]

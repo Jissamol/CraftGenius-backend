@@ -5,7 +5,8 @@ from decimal import Decimal
 from products.models import (
     Category, Product, Order, OrderTimeline,
     RefundRequest, PaymentReconciliation, Earning,
-    SellerPayout, SellerLedgerEntry
+    SellerPayout, SellerLedgerEntry,
+    AdminAuditLog, PlatformMonitoringLog, CommissionSetting
 )
 
 User = get_user_model()
@@ -317,4 +318,106 @@ class OrderManagementTests(TestCase):
         self.assertEqual(payout_entry.amount, Decimal('500.00'))
         self.assertFalse(payout_entry.is_credit)
         self.assertEqual(payout_entry.balance_after, Decimal('1000.00'))
+
+
+class AdminAuditAndMonitoringTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            email='superadmin@example.com',
+            password='password123',
+            name='Master Admin',
+            role='ADMIN',
+            is_superuser=True
+        )
+        self.seller = User.objects.create_user(
+            email='artisan_cand@example.com',
+            password='password123',
+            name='Candidate Artisan',
+            role='HANDICRAFTER',
+            is_approved=False
+        )
+        self.category = Category.objects.create(name='Clay & Ceramics', slug='clay-ceramics')
+        self.product = Product.objects.create(
+            name='Handmade Pot',
+            seller=self.seller,
+            category=self.category,
+            price=Decimal('250.00'),
+            stock=5,
+            is_approved=False
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_seller_approval_audit_log(self):
+        """Admin approving handicrafter writes to AdminAuditLog."""
+        res = self.client.put(f'/api/admin/handicrafters/{self.seller.id}/approve/')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(
+            action_type='SELLER_APPROVAL',
+            target_id=str(self.seller.id)
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.admin, self.admin)
+        self.assertEqual(log.details.get('decision'), 'APPROVED')
+
+    def test_product_moderation_audit_log(self):
+        """Admin approving product writes to AdminAuditLog."""
+        res = self.client.put(f'/api/admin/products/{self.product.id}/approve/')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(
+            action_type='PRODUCT_MODERATION',
+            target_id=str(self.product.id)
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.details.get('decision'), 'APPROVED')
+
+    def test_commission_change_audit_log(self):
+        """Admin changing commission rate records before and after values in audit log."""
+        CommissionSetting.objects.update_or_create(id=1, defaults={'percentage': Decimal('10.00')})
+
+        res = self.client.put('/api/admin/commission/', {'percentage': 12.50}, format='json')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(action_type='COMMISSION_CHANGE').first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.details.get('new_rate'), 12.50)
+        self.assertEqual(log.details.get('previous_rate'), 10.00)
+
+    def test_platform_monitoring_incident_and_resolve(self):
+        """Platform error log creation and administrative resolution."""
+        incident = PlatformMonitoringLog.record(
+            log_type='PAYMENT_FAILURE',
+            severity='WARNING',
+            source='STRIPE_CHECKOUT',
+            event_id='evt_test_failed_123',
+            customer_email='buyer@example.com',
+            error_message='Payment method card_declined by issuer.',
+            payload={'decline_code': 'insufficient_funds'}
+        )
+        self.assertFalse(incident.is_resolved)
+
+        # Query monitoring summary & logs
+        res = self.client.get('/api/admin/monitoring/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['health_summary']['total_events'], 1)
+        self.assertEqual(res.json()['health_summary']['unresolved_count'], 1)
+
+        # Resolve incident
+        resolve_res = self.client.post(
+            f'/api/admin/monitoring/{incident.id}/resolve/',
+            {'notes': 'Customer re-attempted with alternate card successfully.'},
+            format='json'
+        )
+        self.assertEqual(resolve_res.status_code, 200)
+        incident.refresh_from_db()
+        self.assertTrue(incident.is_resolved)
+        self.assertEqual(incident.resolved_by, self.admin)
+
+        # Check that resolution was also recorded into the admin audit log
+        res_audit = self.client.get('/api/admin/audit-logs/')
+        self.assertEqual(res_audit.status_code, 200)
+        logs = res_audit.json()['logs']
+        self.assertTrue(any('Resolved monitoring incident' in r['action_summary'] for r in logs))
 

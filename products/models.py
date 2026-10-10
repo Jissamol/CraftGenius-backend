@@ -731,3 +731,110 @@ class SellerLedgerEntry(models.Model):
             reference_id=reference_id
         )
 
+
+class AdminAuditLog(models.Model):
+    ACTION_TYPES = (
+        ('PRODUCT_MODERATION', 'Product Moderation'),
+        ('SELLER_APPROVAL', 'Seller Approval & Status'),
+        ('COMMISSION_CHANGE', 'Commission Rate Change'),
+        ('DISPUTE_RESOLUTION', 'Dispute Resolution'),
+        ('PAYOUT_DECISION', 'Payout Decision'),
+        ('REFUND_DECISION', 'Refund & Return Decision'),
+        ('CATEGORY_MANAGEMENT', 'Category Management'),
+        ('OTHER', 'General Admin Action'),
+    )
+
+    admin = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='admin_audit_logs'
+    )
+    action_type = models.CharField(max_length=40, choices=ACTION_TYPES)
+    target_model = models.CharField(max_length=60)
+    target_id = models.CharField(max_length=100, blank=True, default='')
+    target_repr = models.CharField(max_length=255, blank=True, default='')
+    action_summary = models.CharField(max_length=255)
+    details = models.JSONField(default=dict, blank=True)
+    ip_address = models.CharField(max_length=45, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        admin_name = self.admin.name if self.admin else 'System'
+        return f"[{self.action_type}] {admin_name}: {self.action_summary} ({self.created_at.strftime('%Y-%m-%d %H:%M')})"
+
+    @classmethod
+    def log(cls, admin, action_type, target_model, target_id, action_summary, target_repr='', details=None, ip_address=''):
+        return cls.objects.create(
+            admin=admin if (admin and getattr(admin, 'is_authenticated', False)) else None,
+            action_type=action_type,
+            target_model=target_model,
+            target_id=str(target_id),
+            target_repr=target_repr,
+            action_summary=action_summary,
+            details=details or {},
+            ip_address=ip_address or ''
+        )
+
+
+class PlatformMonitoringLog(models.Model):
+    LOG_TYPES = (
+        ('PAYMENT_FAILURE', 'Payment Failure'),
+        ('WEBHOOK_ERROR', 'Stripe Webhook Error'),
+        ('GATEWAY_ANOMALY', 'Payment Gateway Anomaly'),
+        ('SYSTEM_ERROR', 'Platform System Error'),
+    )
+    SEVERITY_LEVELS = (
+        ('INFO', 'Informational'),
+        ('WARNING', 'Warning'),
+        ('ERROR', 'Error'),
+        ('CRITICAL', 'Critical Alert'),
+    )
+
+    log_type = models.CharField(max_length=30, choices=LOG_TYPES)
+    severity = models.CharField(max_length=20, choices=SEVERITY_LEVELS, default='ERROR')
+    source = models.CharField(max_length=100, help_text="e.g. Stripe Webhook, Payment Intent, Checkout Session")
+    event_id = models.CharField(max_length=150, blank=True, default='', help_text="Session ID, Event ID, or Gateway Intent ID")
+    order = models.ForeignKey(
+        Order,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='monitoring_logs'
+    )
+    customer_email = models.CharField(max_length=255, blank=True, default='')
+    error_message = models.TextField()
+    payload = models.JSONField(default=dict, blank=True)
+    is_resolved = models.BooleanField(default=False)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='resolved_monitoring_logs'
+    )
+    resolution_notes = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f"[{self.severity}] {self.log_type} from {self.source}: {self.error_message[:60]}"
+
+    @classmethod
+    def record(cls, log_type, severity, source, error_message, event_id='', order=None, customer_email='', payload=None):
+        return cls.objects.create(
+            log_type=log_type,
+            severity=severity,
+            source=source,
+            error_message=error_message,
+            event_id=str(event_id) if event_id else '',
+            order=order,
+            customer_email=customer_email or '',
+            payload=payload or {}
+        )
+
+

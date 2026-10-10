@@ -2,7 +2,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from django.db.models import Sum, Count, Avg, F
+from django.db.models import Sum, Count, Avg, F, Q
 from django.db.models.functions import TruncDate, TruncMonth
 from django.utils import timezone
 from datetime import timedelta
@@ -14,14 +14,16 @@ from .models import (
     Category, Product, Order, Review, Earning,
     CommissionSetting, Dispute, OrderTimeline,
     RefundRequest, PaymentReconciliation,
-    SellerPayout, SellerLedgerEntry
+    SellerPayout, SellerLedgerEntry,
+    AdminAuditLog, PlatformMonitoringLog
 )
 from .admin_serializers import (
     AdminUserSerializer, AdminHandicrafterSerializer,
     AdminProductSerializer, AdminOrderSerializer,
     AdminReviewSerializer, AdminCategorySerializer,
     CommissionSettingSerializer, DisputeSerializer,
-    AdminRefundRequestSerializer
+    AdminRefundRequestSerializer, AdminAuditLogSerializer,
+    PlatformMonitoringLogSerializer
 )
 
 User = get_user_model()
@@ -42,6 +44,15 @@ def admin_required(func):
         return func(request, *args, **kwargs)
     wrapper.__name__ = func.__name__
     return wrapper
+
+
+def get_client_ip(request):
+    """Extract client IP address from request headers."""
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '')
+
 
 
 # ─────────────────── Dashboard ───────────────────
@@ -218,6 +229,18 @@ def admin_approve_handicrafter(request, pk):
         user = User.objects.get(id=pk, role='HANDICRAFTER')
         user.is_approved = True
         user.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='SELLER_APPROVAL',
+            target_model='User',
+            target_id=user.id,
+            target_repr=user.name,
+            action_summary=f"Approved handicrafter '{user.name}' ({user.email})",
+            details={'decision': 'APPROVED', 'seller_email': user.email},
+            ip_address=get_client_ip(request)
+        )
+
         return Response({'detail': f'{user.name} approved successfully.'})
     except User.DoesNotExist:
         return Response({'detail': 'Handicrafter not found.'}, status=404)
@@ -233,6 +256,18 @@ def admin_reject_handicrafter(request, pk):
         user.is_approved = False
         user.is_active = False
         user.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='SELLER_APPROVAL',
+            target_model='User',
+            target_id=user.id,
+            target_repr=user.name,
+            action_summary=f"Rejected handicrafter '{user.name}' ({user.email})",
+            details={'decision': 'REJECTED', 'reason': reason, 'seller_email': user.email},
+            ip_address=get_client_ip(request)
+        )
+
         return Response({'detail': f'{user.name} rejected.', 'reason': reason})
     except User.DoesNotExist:
         return Response({'detail': 'Handicrafter not found.'}, status=404)
@@ -262,6 +297,18 @@ def admin_approve_product(request, pk):
         product = Product.objects.get(id=pk)
         product.is_approved = True
         product.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='PRODUCT_MODERATION',
+            target_model='Product',
+            target_id=product.id,
+            target_repr=product.name,
+            action_summary=f"Approved product '{product.name}' (ID: #{product.id})",
+            details={'decision': 'APPROVED', 'seller': product.seller.name if product.seller else '', 'price': float(product.price)},
+            ip_address=get_client_ip(request)
+        )
+
         return Response({'detail': f'{product.name} approved.'})
     except Product.DoesNotExist:
         return Response({'detail': 'Product not found.'}, status=404)
@@ -275,6 +322,18 @@ def admin_reject_product(request, pk):
         product = Product.objects.get(id=pk)
         product.is_approved = False
         product.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='PRODUCT_MODERATION',
+            target_model='Product',
+            target_id=product.id,
+            target_repr=product.name,
+            action_summary=f"Rejected product '{product.name}' (ID: #{product.id})",
+            details={'decision': 'REJECTED', 'seller': product.seller.name if product.seller else ''},
+            ip_address=get_client_ip(request)
+        )
+
         return Response({'detail': f'{product.name} rejected.'})
     except Product.DoesNotExist:
         return Response({'detail': 'Product not found.'}, status=404)
@@ -287,7 +346,21 @@ def admin_delete_product(request, pk):
     try:
         product = Product.objects.get(id=pk)
         name = product.name
+        prod_id = product.id
+        seller_name = product.seller.name if product.seller else ''
         product.delete()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='PRODUCT_MODERATION',
+            target_model='Product',
+            target_id=prod_id,
+            target_repr=name,
+            action_summary=f"Deleted product '{name}' (ID: #{prod_id}) from marketplace",
+            details={'decision': 'DELETED', 'seller': seller_name},
+            ip_address=get_client_ip(request)
+        )
+
         return Response({'detail': f'{name} deleted.'})
     except Product.DoesNotExist:
         return Response({'detail': 'Product not found.'}, status=404)
@@ -554,6 +627,17 @@ def admin_decide_refund_request(request, pk):
         refund_req.decided_at = timezone.now()
         refund_req.save()
 
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='REFUND_DECISION',
+            target_model='RefundRequest',
+            target_id=refund_req.id,
+            target_repr=f"Refund Request #{refund_req.id} for Order #{order.id}",
+            action_summary=f"Approved refund of ₹{refund_amount} for Order #{order.id}",
+            details={'decision': 'APPROVED', 'amount': float(refund_amount), 'order_id': order.id, 'admin_notes': admin_notes},
+            ip_address=get_client_ip(request)
+        )
+
         order.add_timeline(
             status='REFUNDED',
             title='Refund Request Approved',
@@ -575,6 +659,17 @@ def admin_decide_refund_request(request, pk):
         refund_req.decided_by = request.user
         refund_req.decided_at = timezone.now()
         refund_req.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='REFUND_DECISION',
+            target_model='RefundRequest',
+            target_id=refund_req.id,
+            target_repr=f"Refund Request #{refund_req.id} for Order #{order.id}",
+            action_summary=f"Rejected refund request #{refund_req.id} for Order #{order.id}",
+            details={'decision': 'REJECTED', 'order_id': order.id, 'reason': admin_notes},
+            ip_address=get_client_ip(request)
+        )
 
         order.add_timeline(
             status=order.status,
@@ -702,11 +797,24 @@ def admin_disputes(request):
 def admin_update_dispute(request, pk):
     try:
         dispute = Dispute.objects.get(id=pk)
+        old_status = dispute.status
         new_status = request.data.get('status', dispute.status)
         resolution = request.data.get('resolution', dispute.resolution)
         dispute.status = new_status
         dispute.resolution = resolution
         dispute.save()
+
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='DISPUTE_RESOLUTION',
+            target_model='Dispute',
+            target_id=dispute.id,
+            target_repr=f"Dispute #{dispute.id} ({dispute.subject})",
+            action_summary=f"Updated Dispute #{dispute.id} status from '{old_status}' to '{new_status}'",
+            details={'old_status': old_status, 'new_status': new_status, 'resolution': resolution, 'order_id': dispute.order_id},
+            ip_address=get_client_ip(request)
+        )
+
         serializer = DisputeSerializer(dispute)
         return Response(serializer.data)
     except Dispute.DoesNotExist:
@@ -746,9 +854,22 @@ def admin_commission(request):
     else:
         percentage = request.data.get('percentage')
         if percentage is not None:
+            prev_rate = float(setting.percentage)
             setting.percentage = percentage
             setting.updated_by = request.user
             setting.save()
+
+            AdminAuditLog.log(
+                admin=request.user,
+                action_type='COMMISSION_CHANGE',
+                target_model='CommissionSetting',
+                target_id=setting.id,
+                target_repr="Platform Commission",
+                action_summary=f"Changed platform commission rate from {prev_rate}% to {percentage}%",
+                details={'previous_rate': prev_rate, 'new_rate': float(percentage)},
+                ip_address=get_client_ip(request)
+            )
+
             return Response(CommissionSettingSerializer(setting).data)
         return Response({'detail': 'Percentage is required.'}, status=400)
 
@@ -806,6 +927,17 @@ def admin_process_payout(request, pk):
             reference_id=reference_id
         )
 
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='PAYOUT_DECISION',
+            target_model='SellerPayout',
+            target_id=payout.id,
+            target_repr=f"Payout #{payout.id} for {payout.seller.name}",
+            action_summary=f"Approved payout of ₹{payout.amount} for {payout.seller.name} (Ref: {reference_id})",
+            details={'decision': 'APPROVED', 'amount': float(payout.amount), 'seller': payout.seller.name, 'reference_id': reference_id},
+            ip_address=get_client_ip(request)
+        )
+
         from .serializers import SellerPayoutSerializer
         return Response({
             'detail': f"Payout #{pk} of ₹{payout.amount} approved and marked PAID.",
@@ -820,6 +952,17 @@ def admin_process_payout(request, pk):
         payout.notes = notes
         payout.save()
 
+        AdminAuditLog.log(
+            admin=request.user,
+            action_type='PAYOUT_DECISION',
+            target_model='SellerPayout',
+            target_id=payout.id,
+            target_repr=f"Payout #{payout.id} for {payout.seller.name}",
+            action_summary=f"Rejected payout #{payout.id} (₹{payout.amount}) for {payout.seller.name}",
+            details={'decision': 'REJECTED', 'amount': float(payout.amount), 'seller': payout.seller.name, 'reason': notes},
+            ip_address=get_client_ip(request)
+        )
+
         from .serializers import SellerPayoutSerializer
         return Response({
             'detail': f"Payout #{pk} was rejected.",
@@ -828,3 +971,136 @@ def admin_process_payout(request, pk):
 
     else:
         return Response({'detail': "Invalid action. Use 'APPROVE' or 'REJECT'."}, status=400)
+
+
+# ─────────────────── Audit Logs & Monitoring ───────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_audit_logs(request):
+    """
+    Returns audit log entries for important admin decisions:
+    Product moderation, seller approvals, commission changes, dispute resolutions, etc.
+    """
+    qs = AdminAuditLog.objects.select_related('admin')
+
+    action_type = request.query_params.get('action_type')
+    if action_type and action_type != 'ALL':
+        qs = qs.filter(action_type=action_type)
+
+    search = request.query_params.get('search')
+    if search:
+        qs = qs.filter(
+            Q(action_summary__icontains=search) |
+            Q(target_repr__icontains=search) |
+            Q(admin__name__icontains=search)
+        )
+
+    # Summary counts
+    total_logs = AdminAuditLog.objects.count()
+    counts_by_type = {
+        'PRODUCT_MODERATION': AdminAuditLog.objects.filter(action_type='PRODUCT_MODERATION').count(),
+        'SELLER_APPROVAL': AdminAuditLog.objects.filter(action_type='SELLER_APPROVAL').count(),
+        'COMMISSION_CHANGE': AdminAuditLog.objects.filter(action_type='COMMISSION_CHANGE').count(),
+        'DISPUTE_RESOLUTION': AdminAuditLog.objects.filter(action_type='DISPUTE_RESOLUTION').count(),
+        'PAYOUT_DECISION': AdminAuditLog.objects.filter(action_type='PAYOUT_DECISION').count(),
+        'REFUND_DECISION': AdminAuditLog.objects.filter(action_type='REFUND_DECISION').count(),
+    }
+
+    serializer = AdminAuditLogSerializer(qs[:150], many=True)
+    return Response({
+        'total_logs': total_logs,
+        'counts': counts_by_type,
+        'logs': serializer.data
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_monitoring_logs(request):
+    """
+    Returns platform error logs and monitoring reports for failed payments and webhook events.
+    """
+    qs = PlatformMonitoringLog.objects.select_related('order', 'resolved_by')
+
+    log_type = request.query_params.get('log_type')
+    if log_type and log_type != 'ALL':
+        qs = qs.filter(log_type=log_type)
+
+    severity = request.query_params.get('severity')
+    if severity and severity != 'ALL':
+        qs = qs.filter(severity=severity)
+
+    resolved = request.query_params.get('resolved')
+    if resolved in ['true', 'false']:
+        qs = qs.filter(is_resolved=(resolved == 'true'))
+
+    search = request.query_params.get('search')
+    if search:
+        qs = qs.filter(
+            Q(error_message__icontains=search) |
+            Q(source__icontains=search) |
+            Q(event_id__icontains=search) |
+            Q(customer_email__icontains=search)
+        )
+
+    # Summary Health Report
+    total_logs = PlatformMonitoringLog.objects.count()
+    unresolved_count = PlatformMonitoringLog.objects.filter(is_resolved=False).count()
+    payment_failures = PlatformMonitoringLog.objects.filter(log_type='PAYMENT_FAILURE').count()
+    webhook_errors = PlatformMonitoringLog.objects.filter(log_type='WEBHOOK_ERROR').count()
+    critical_alerts = PlatformMonitoringLog.objects.filter(severity='CRITICAL', is_resolved=False).count()
+
+    gateway_health = 'DEGRADED' if critical_alerts > 0 else 'HEALTHY'
+
+    serializer = PlatformMonitoringLogSerializer(qs[:150], many=True)
+    return Response({
+        'health_summary': {
+            'total_events': total_logs,
+            'unresolved_count': unresolved_count,
+            'payment_failures': payment_failures,
+            'webhook_errors': webhook_errors,
+            'critical_alerts': critical_alerts,
+            'gateway_health': gateway_health,
+        },
+        'logs': serializer.data
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_resolve_monitoring_log(request, pk):
+    """
+    Mark an error monitoring or payment anomaly event as resolved.
+    """
+    try:
+        log_entry = PlatformMonitoringLog.objects.get(pk=pk)
+    except PlatformMonitoringLog.DoesNotExist:
+        return Response({'detail': 'Monitoring log not found.'}, status=404)
+
+    notes = request.data.get('notes', '').strip()
+    log_entry.is_resolved = True
+    log_entry.resolved_at = timezone.now()
+    log_entry.resolved_by = request.user
+    log_entry.resolution_notes = notes
+    log_entry.save()
+
+    AdminAuditLog.log(
+        admin=request.user,
+        action_type='OTHER',
+        target_model='PlatformMonitoringLog',
+        target_id=log_entry.id,
+        target_repr=f"Error Log #{log_entry.id} ({log_entry.log_type})",
+        action_summary=f"Resolved monitoring incident #{log_entry.id} ({log_entry.log_type})",
+        details={'log_id': log_entry.id, 'notes': notes},
+        ip_address=get_client_ip(request)
+    )
+
+    return Response({
+        'detail': f'Incident #{pk} marked as resolved.',
+        'log': PlatformMonitoringLogSerializer(log_entry).data
+    })
+
