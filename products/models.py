@@ -115,6 +115,148 @@ class Order(models.Model):
     stripe_session_id = models.CharField(max_length=255, blank=True, default='')
     stripe_payment_intent = models.CharField(max_length=255, blank=True, default='')
     tracking_number = models.CharField(max_length=100, blank=True, default='')
+    cancellation_reason = models.TextField(blank=True, default='')
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='cancelled_orders'
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    stock_restored = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    VALID_TRANSITIONS = {
+        'PENDING': ['PROCESSING', 'CANCELLED', 'FAILED'],
+        'PROCESSING': ['SHIPPED', 'CANCELLED'],
+        'SHIPPED': ['DELIVERED', 'RETURN_REQUESTED', 'DISPUTED'],
+        'DELIVERED': ['RETURN_REQUESTED', 'REFUNDED', 'DISPUTED'],
+        'RETURN_REQUESTED': ['RETURNED', 'PROCESSING', 'DISPUTED'],
+        'RETURNED': ['REFUNDED', 'DISPUTED'],
+        'DISPUTED': ['RESOLVED', 'REFUNDED', 'CANCELLED', 'PROCESSING'],
+        'CANCELLED': ['REFUNDED'],
+        'REFUNDED': [],
+        'FAILED': [],
+    }
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Order #{self.id} - {self.product.name}"
+
+    def can_transition_to(self, new_status, user=None):
+        """Validate if order can transition to new_status based on current status and user role."""
+        if self.status == new_status:
+            return True, "Status is already up to date."
+        
+        allowed_targets = self.VALID_TRANSITIONS.get(self.status, [])
+        if new_status not in allowed_targets:
+            return False, f"Invalid transition: Cannot move order from {self.status} to {new_status}."
+
+        if user:
+            role = getattr(user, 'role', '')
+            is_admin_user = role == 'ADMIN' or getattr(user, 'is_superuser', False)
+
+            if not is_admin_user:
+                if role == 'CUSTOMER':
+                    if new_status == 'CANCELLED' and self.status not in ['PENDING', 'PROCESSING']:
+                        return False, "Orders cannot be cancelled once they have been shipped."
+                    if new_status == 'RETURN_REQUESTED' and self.status != 'DELIVERED':
+                        return False, "Return requests can only be placed on delivered orders."
+                    if new_status not in ['CANCELLED', 'RETURN_REQUESTED']:
+                        return False, "Customers cannot set this order status directly."
+
+                elif role == 'HANDICRAFTER':
+                    if new_status not in ['PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED']:
+                        return False, "Sellers cannot set this order status directly."
+                    if new_status == 'DELIVERED' and self.status != 'SHIPPED':
+                        return False, "Order must be marked as Shipped before it can be marked Delivered."
+
+        return True, "Valid transition."
+
+    def restore_stock(self):
+        """Idempotently restore stock for the ordered product."""
+        if not self.stock_restored:
+            self.product.stock += self.quantity
+            self.product.save(update_fields=['stock'])
+            self.stock_restored = True
+            self.save(update_fields=['stock_restored'])
+            return True
+        return False
+
+    def add_timeline(self, status, title, notes="", changed_by=None):
+        return OrderTimeline.objects.create(
+            order=self,
+            status=status,
+            title=title,
+            notes=notes,
+            changed_by=changed_by
+        )
+
+
+class OrderTimeline(models.Model):
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name='timeline'
+    )
+    status = models.CharField(max_length=40)
+    title = models.CharField(max_length=150)
+    notes = models.TextField(blank=True, default='')
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='order_timeline_events'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Order #{self.order_id} - {self.title} ({self.created_at.strftime('%Y-%m-%d %H:%M')})"
+
+
+class RefundRequest(models.Model):
+    REASON_CHOICES = (
+        ('DEFECTIVE', 'Defective or Damaged Product'),
+        ('WRONG_ITEM', 'Wrong Item Received'),
+        ('NOT_AS_DESCRIBED', 'Product Not as Described'),
+        ('CANCELLED_ORDER', 'Order Cancelled Before Shipping'),
+        ('LATE_DELIVERY', 'Delivery Delayed / Not Received'),
+        ('OTHER', 'Other Reason'),
+    )
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending Admin Review'),
+        ('APPROVED', 'Approved & Reconciled'),
+        ('REJECTED', 'Rejected'),
+    )
+
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name='refund_requests'
+    )
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='refund_requests'
+    )
+    reason = models.CharField(max_length=50, choices=REASON_CHOICES)
+    explanation = models.TextField()
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    admin_notes = models.TextField(blank=True, default='')
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='decided_refund_requests'
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -122,7 +264,47 @@ class Order(models.Model):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"Order #{self.id} - {self.product.name}"
+        return f"RefundRequest #{self.id} for Order #{self.order_id} - ₹{self.amount} ({self.status})"
+
+
+class PaymentReconciliation(models.Model):
+    STATUS_CHOICES = (
+        ('SUCCESS', 'Success'),
+        ('PENDING', 'Pending'),
+        ('FAILED', 'Failed'),
+        ('SIMULATED', 'Manual / Simulated Reconciliation'),
+    )
+
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name='payment_reconciliations'
+    )
+    refund_request = models.ForeignKey(
+        RefundRequest,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='reconciliations'
+    )
+    payment_intent_id = models.CharField(max_length=255, blank=True, default='')
+    refund_transaction_id = models.CharField(max_length=255, blank=True, default='')
+    original_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    refunded_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    gateway_status = models.CharField(max_length=50, default='SUCCEEDED')
+    is_reconciled = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, default='')
+    reconciled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Reconciliation for Order #{self.order_id} - ₹{self.refunded_amount} ({self.gateway_status})"
 
 
 class Review(models.Model):
@@ -180,6 +362,8 @@ class Earning(models.Model):
     STATUS_CHOICES = (
         ('PENDING', 'Pending'),
         ('PAID', 'Paid'),
+        ('CANCELLED', 'Cancelled'),
+        ('REFUNDED', 'Refunded'),
     )
 
     seller = models.ForeignKey(

@@ -2,7 +2,8 @@ from rest_framework import serializers
 from django.db import models as db_models
 from .models import (
     Category, Product, ProductImage, Order, Review,
-    SellerProfile, Earning, CommissionSetting, Dispute
+    SellerProfile, Earning, CommissionSetting, Dispute,
+    OrderTimeline, RefundRequest, PaymentReconciliation
 )
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -104,12 +105,57 @@ class AdminProductSerializer(serializers.ModelSerializer):
         return obj.orders.count()
 
 
+class AdminOrderTimelineSerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.CharField(source='changed_by.name', read_only=True, default='')
+
+    class Meta:
+        model = OrderTimeline
+        fields = ['id', 'status', 'title', 'notes', 'changed_by', 'changed_by_name', 'created_at']
+
+
+class AdminRefundRequestSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    customer_email = serializers.CharField(source='customer.email', read_only=True)
+    product_name = serializers.CharField(source='order.product.name', read_only=True)
+    seller_name = serializers.CharField(source='order.seller.name', read_only=True)
+    order_total = serializers.DecimalField(source='order.total_amount', max_digits=10, decimal_places=2, read_only=True)
+    reason_display = serializers.CharField(source='get_reason_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    decided_by_name = serializers.CharField(source='decided_by.name', read_only=True, default='')
+
+    class Meta:
+        model = RefundRequest
+        fields = [
+            'id', 'order', 'customer', 'customer_name', 'customer_email',
+            'product_name', 'seller_name', 'order_total',
+            'reason', 'reason_display', 'explanation', 'amount',
+            'status', 'status_display', 'admin_notes',
+            'decided_by', 'decided_by_name', 'decided_at', 'created_at', 'updated_at'
+        ]
+
+
+class AdminPaymentReconciliationSerializer(serializers.ModelSerializer):
+    reconciled_by_name = serializers.CharField(source='reconciled_by.name', read_only=True, default='')
+
+    class Meta:
+        model = PaymentReconciliation
+        fields = [
+            'id', 'order', 'refund_request', 'payment_intent_id',
+            'refund_transaction_id', 'original_amount', 'refunded_amount',
+            'gateway_status', 'is_reconciled', 'notes', 'reconciled_by',
+            'reconciled_by_name', 'created_at'
+        ]
+
+
 class AdminOrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     customer_email = serializers.CharField(source='customer.email', read_only=True)
     seller_name = serializers.CharField(source='seller.name', read_only=True)
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_image = serializers.SerializerMethodField()
+    timeline = AdminOrderTimelineSerializer(many=True, read_only=True)
+    refund_requests = AdminRefundRequestSerializer(many=True, read_only=True)
+    payment_reconciliations = AdminPaymentReconciliationSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -117,7 +163,10 @@ class AdminOrderSerializer(serializers.ModelSerializer):
             'id', 'customer', 'customer_name', 'customer_email',
             'seller', 'seller_name', 'product', 'product_name',
             'product_image', 'quantity', 'total_amount', 'status',
-            'tracking_number', 'created_at', 'updated_at'
+            'is_paid', 'stripe_payment_intent', 'tracking_number',
+            'cancellation_reason', 'cancelled_at', 'stock_restored',
+            'timeline', 'refund_requests', 'payment_reconciliations',
+            'created_at', 'updated_at'
         ]
 
     def get_product_image(self, obj):

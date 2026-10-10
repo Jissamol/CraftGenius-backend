@@ -54,6 +54,8 @@ urlpatterns = [
     path('orders/create/', views.create_order, name='create-order'),
     path('orders/customer/', views.customer_orders, name='customer-orders'),
     path('orders/<int:pk>/cancel/', views.cancel_order, name='cancel-order'),
+    path('orders/<int:pk>/request-refund/', views.request_refund, name='request-refund'),
+    path('orders/<int:pk>/timeline/', views.order_timeline, name='order-timeline'),
 
     # Wishlist
     path('wishlist/', views.get_wishlist, name='get-wishlist'),
@@ -95,6 +97,8 @@ urlpatterns = [
     path('admin/orders/', admin_views.admin_orders, name='admin-orders'),
     path('admin/orders/<int:pk>/status/', admin_views.admin_update_order_status, name='admin-update-order-status'),
     path('admin/orders/<int:pk>/refund/', admin_views.admin_refund_order, name='admin-refund-order'),
+    path('admin/refund-requests/', admin_views.admin_refund_requests, name='admin-refund-requests'),
+    path('admin/refund-requests/<int:pk>/decide/', admin_views.admin_decide_refund_request, name='admin-decide-refund-request'),
 
     # Customers
     path('admin/customers/', admin_views.admin_customers, name='admin-customers'),

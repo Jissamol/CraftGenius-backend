@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from .models import (
     Category, Product, ProductImage, Order, Review,
-    SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile
+    SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
+    OrderTimeline, RefundRequest, PaymentReconciliation
 )
 
 
@@ -60,21 +61,64 @@ class ProductCreateSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+class OrderTimelineSerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.CharField(source='changed_by.name', read_only=True, default='')
+
+    class Meta:
+        model = OrderTimeline
+        fields = ['id', 'status', 'title', 'notes', 'changed_by', 'changed_by_name', 'created_at']
+
+
+class RefundRequestSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.name', read_only=True)
+    reason_display = serializers.CharField(source='get_reason_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = RefundRequest
+        fields = [
+            'id', 'order', 'customer', 'customer_name', 'reason',
+            'reason_display', 'explanation', 'amount', 'status',
+            'status_display', 'admin_notes', 'decided_at', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['customer', 'status', 'admin_notes', 'decided_at']
+
+
+class PaymentReconciliationSerializer(serializers.ModelSerializer):
+    reconciled_by_name = serializers.CharField(source='reconciled_by.name', read_only=True, default='')
+
+    class Meta:
+        model = PaymentReconciliation
+        fields = [
+            'id', 'order', 'refund_request', 'payment_intent_id',
+            'refund_transaction_id', 'original_amount', 'refunded_amount',
+            'gateway_status', 'is_reconciled', 'notes', 'reconciled_by',
+            'reconciled_by_name', 'created_at'
+        ]
+
+
 class OrderSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source='customer.name', read_only=True)
     customer_email = serializers.CharField(source='customer.email', read_only=True)
+    seller_name = serializers.CharField(source='seller.name', read_only=True)
     product_name = serializers.CharField(source='product.name', read_only=True)
     product_image = serializers.SerializerMethodField()
+    timeline = OrderTimelineSerializer(many=True, read_only=True)
+    refund_requests = RefundRequestSerializer(many=True, read_only=True)
+    payment_reconciliations = PaymentReconciliationSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
         fields = [
             'id', 'customer', 'customer_name', 'customer_email',
             'product', 'product_name', 'product_image',
-            'seller', 'quantity', 'total_amount', 'status',
-            'tracking_number', 'created_at', 'updated_at'
+            'seller', 'seller_name', 'quantity', 'total_amount', 'status',
+            'is_paid', 'stripe_payment_intent', 'tracking_number',
+            'cancellation_reason', 'cancelled_at', 'stock_restored',
+            'timeline', 'refund_requests', 'payment_reconciliations',
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['customer', 'product', 'seller', 'total_amount']
+        read_only_fields = ['customer', 'product', 'seller', 'total_amount', 'is_paid']
 
     def get_product_image(self, obj):
         img = obj.product.primary_image
@@ -88,9 +132,10 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class OrderStatusSerializer(serializers.Serializer):
     status = serializers.ChoiceField(
-        choices=['PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED']
+        choices=['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED', 'REFUNDED']
     )
     tracking_number = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class ReviewSerializer(serializers.ModelSerializer):
