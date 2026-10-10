@@ -6,13 +6,15 @@ from django.db.models import Sum, Count, Avg, F
 from django.db.models.functions import TruncDate, TruncMonth
 from django.utils import timezone
 from datetime import timedelta
+from decimal import Decimal
 from django.contrib.auth import get_user_model
 
 import stripe
 from .models import (
     Category, Product, Order, Review, Earning,
     CommissionSetting, Dispute, OrderTimeline,
-    RefundRequest, PaymentReconciliation
+    RefundRequest, PaymentReconciliation,
+    SellerPayout, SellerLedgerEntry
 )
 from .admin_serializers import (
     AdminUserSerializer, AdminHandicrafterSerializer,
@@ -531,6 +533,21 @@ def admin_decide_refund_request(request, pk):
             order.earning.status = 'REFUNDED'
             order.earning.save()
 
+        # Record refund deduction in Seller Transaction Ledger
+        comm_rate = CommissionSetting.get_rate()
+        comm = (Decimal(str(refund_amount)) * comm_rate) / Decimal('100.00')
+        net_deduction = Decimal(str(refund_amount)) - comm
+        if not SellerLedgerEntry.objects.filter(order=order, entry_type='REFUND').exists():
+            SellerLedgerEntry.record(
+                seller=order.seller,
+                entry_type='REFUND',
+                amount=net_deduction,
+                is_credit=False,
+                description=f"Refund approved for Order #{order.id} (Refund Request #{refund_req.id})",
+                order=order,
+                reference_id=refund_id
+            )
+
         refund_req.status = 'APPROVED'
         refund_req.admin_notes = admin_notes
         refund_req.decided_by = request.user
@@ -734,3 +751,80 @@ def admin_commission(request):
             setting.save()
             return Response(CommissionSettingSerializer(setting).data)
         return Response({'detail': 'Percentage is required.'}, status=400)
+
+
+# ─────────────────── Payouts ───────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_payout_list(request):
+    payout_status = request.query_params.get('status')
+    qs = SellerPayout.objects.select_related('seller', 'decided_by')
+    if payout_status:
+        qs = qs.filter(status=payout_status.upper())
+
+    from .serializers import SellerPayoutSerializer
+    serializer = SellerPayoutSerializer(qs, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_process_payout(request, pk):
+    try:
+        payout = SellerPayout.objects.select_related('seller').get(pk=pk)
+    except SellerPayout.DoesNotExist:
+        return Response({'detail': 'Payout not found.'}, status=404)
+
+    if payout.status not in ['PENDING', 'PROCESSING']:
+        return Response({'detail': f'Payout #{pk} is already {payout.status}.'}, status=400)
+
+    action = request.data.get('action', '').upper()
+    reference_id = request.data.get('reference_id', '').strip()
+    notes = request.data.get('notes', '').strip()
+
+    if action == 'APPROVE':
+        if not reference_id:
+            reference_id = f"UTR_{payout.id}_{int(timezone.now().timestamp())}"
+        payout.status = 'PAID'
+        payout.reference_id = reference_id
+        payout.processed_at = timezone.now()
+        payout.decided_by = request.user
+        payout.notes = notes or payout.notes
+        payout.save()
+
+        # Record payout deduction in the immutable seller ledger
+        SellerLedgerEntry.record(
+            seller=payout.seller,
+            entry_type='PAYOUT',
+            amount=payout.amount,
+            is_credit=False,
+            description=f"Payout #{payout.id} processed via {payout.get_payout_method_display()}",
+            payout=payout,
+            reference_id=reference_id
+        )
+
+        from .serializers import SellerPayoutSerializer
+        return Response({
+            'detail': f"Payout #{pk} of ₹{payout.amount} approved and marked PAID.",
+            'payout': SellerPayoutSerializer(payout).data
+        })
+
+    elif action == 'REJECT':
+        if not notes:
+            return Response({'detail': 'Please provide a reason / note for rejecting this payout.'}, status=400)
+        payout.status = 'REJECTED'
+        payout.decided_by = request.user
+        payout.notes = notes
+        payout.save()
+
+        from .serializers import SellerPayoutSerializer
+        return Response({
+            'detail': f"Payout #{pk} was rejected.",
+            'payout': SellerPayoutSerializer(payout).data
+        })
+
+    else:
+        return Response({'detail': "Invalid action. Use 'APPROVE' or 'REJECT'."}, status=400)

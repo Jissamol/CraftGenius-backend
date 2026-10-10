@@ -1,15 +1,18 @@
 from django.test import TestCase
+from rest_framework.test import APIClient
 from django.contrib.auth import get_user_model
 from decimal import Decimal
 from products.models import (
     Category, Product, Order, OrderTimeline,
-    RefundRequest, PaymentReconciliation, Earning
+    RefundRequest, PaymentReconciliation, Earning,
+    SellerPayout, SellerLedgerEntry
 )
 
 User = get_user_model()
 
 class OrderManagementTests(TestCase):
     def setUp(self):
+        self.client = APIClient()
         self.customer = User.objects.create_user(
             email='customer@example.com',
             password='password123',
@@ -212,3 +215,106 @@ class OrderManagementTests(TestCase):
         self.assertTrue(data['artisan']['is_verified'])
         self.assertEqual(len(data['products']), 1)
         self.assertEqual(data['products'][0]['name'], 'Handmade Bowl')
+
+    def test_transaction_ledger_and_transparent_earnings(self):
+        """Test transaction ledger tracking, running balance, and transparent earnings breakdown."""
+        order = Order.objects.create(
+            customer=self.customer,
+            product=self.product,
+            seller=self.seller,
+            quantity=2,
+            total_amount=Decimal('1000.00'),
+            status='PROCESSING',
+            is_paid=True,
+            stripe_payment_intent='pi_ledger_test_100'
+        )
+
+        # Record Gross Sale in ledger
+        entry_sale = SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='SALE',
+            amount=Decimal('1000.00'),
+            is_credit=True,
+            description="Gross Sale for Order #1",
+            order=order,
+            reference_id='pi_ledger_test_100'
+        )
+        self.assertEqual(entry_sale.balance_after, Decimal('1000.00'))
+
+        # Record Platform Commission (10%)
+        entry_comm = SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='COMMISSION',
+            amount=Decimal('100.00'),
+            is_credit=False,
+            description="Platform Commission (10%) for Order #1",
+            order=order,
+            reference_id='pi_ledger_test_100'
+        )
+        self.assertEqual(entry_comm.balance_after, Decimal('900.00'))
+
+        # Authenticate seller and check GET /api/seller/earnings/
+        self.client.force_authenticate(user=self.seller)
+        response = self.client.get('/api/seller/earnings/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(data['gross_sales'], 1000.0)
+        self.assertEqual(data['total_commission'], 100.0)
+        self.assertEqual(data['total_refunds'], 0.0)
+        self.assertEqual(data['net_earnings'], 900.0)
+        self.assertEqual(data['available_balance'], 900.0)
+        self.assertEqual(len(data['ledger_entries']), 2)
+
+    def test_payout_request_and_admin_processing(self):
+        """Test seller payout request, balance reservation, and admin payout processing."""
+        # Seed ledger with 1500 net balance
+        SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='SALE',
+            amount=Decimal('1500.00'),
+            is_credit=True,
+            description="Sale initial balance"
+        )
+
+        self.client.force_authenticate(user=self.seller)
+        
+        # 1. Attempt to withdraw more than available balance (should fail)
+        res_fail = self.client.post('/api/seller/payouts/request/', {
+            'amount': '2000.00',
+            'payout_method': 'BANK_TRANSFER',
+            'account_details': 'HDFC0001, A/C: 123456'
+        })
+        self.assertEqual(res_fail.status_code, 400)
+
+        # 2. Withdraw valid amount
+        res_req = self.client.post('/api/seller/payouts/request/', {
+            'amount': '500.00',
+            'payout_method': 'BANK_TRANSFER',
+            'account_details': 'HDFC0001, A/C: 123456',
+            'notes': 'Monthly payout'
+        })
+        self.assertEqual(res_req.status_code, 201)
+        payout_id = res_req.json()['payout']['id']
+
+        # Available balance should now be 1500 - 500 = 1000
+        res_earn = self.client.get('/api/seller/earnings/')
+        self.assertEqual(res_earn.json()['available_balance'], 1000.0)
+        self.assertEqual(res_earn.json()['pending_payouts'], 500.0)
+
+        # 3. Admin approves payout
+        self.client.force_authenticate(user=self.admin)
+        res_approve = self.client.post(f'/api/admin/payouts/{payout_id}/process/', {
+            'action': 'APPROVE',
+            'reference_id': 'UTR_TEST_12345678'
+        })
+        self.assertEqual(res_approve.status_code, 200)
+        self.assertEqual(res_approve.json()['payout']['status'], 'PAID')
+
+        # Verify payout ledger entry was recorded and balance updated
+        payout_entry = SellerLedgerEntry.objects.filter(payout_id=payout_id, entry_type='PAYOUT').first()
+        self.assertIsNotNone(payout_entry)
+        self.assertEqual(payout_entry.amount, Decimal('500.00'))
+        self.assertFalse(payout_entry.is_credit)
+        self.assertEqual(payout_entry.balance_after, Decimal('1000.00'))
+

@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
@@ -623,4 +624,110 @@ class UserCategoryInterest(models.Model):
 
     def __str__(self):
         return f"{self.user.name} interest in {self.category.name}: {self.score}"
+
+
+class SellerPayout(models.Model):
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending Review'),
+        ('PROCESSING', 'Processing Transfer'),
+        ('PAID', 'Paid / Completed'),
+        ('REJECTED', 'Rejected'),
+    )
+    PAYOUT_METHOD_CHOICES = (
+        ('BANK_TRANSFER', 'Bank Transfer (NEFT/IMPS)'),
+        ('UPI', 'UPI Direct'),
+        ('STRIPE', 'Stripe Connect'),
+    )
+
+    seller = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='payouts'
+    )
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    payout_method = models.CharField(max_length=30, choices=PAYOUT_METHOD_CHOICES, default='BANK_TRANSFER')
+    account_details = models.TextField(help_text="Account number, IFSC, or UPI ID")
+    reference_id = models.CharField(max_length=100, blank=True, default='', help_text="Transaction reference / UTR / Transfer ID")
+    requested_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, default='')
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='decided_payouts'
+    )
+
+    class Meta:
+        ordering = ['-requested_at']
+
+    def __str__(self):
+        return f"Payout #{self.id} for {self.seller.name} - ₹{self.amount} ({self.status})"
+
+
+class SellerLedgerEntry(models.Model):
+    ENTRY_TYPES = (
+        ('SALE', 'Gross Order Sale'),
+        ('COMMISSION', 'Platform Commission Fee'),
+        ('REFUND', 'Customer Refund Deduction'),
+        ('PAYOUT', 'Payout Disbursement'),
+        ('ADJUSTMENT', 'Balance Adjustment'),
+    )
+
+    seller = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='ledger_entries'
+    )
+    entry_type = models.CharField(max_length=30, choices=ENTRY_TYPES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    is_credit = models.BooleanField(help_text="True if adds to seller balance, False if deducts")
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2, help_text="Running available balance after this entry")
+    order = models.ForeignKey(
+        Order,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='ledger_entries'
+    )
+    payout = models.ForeignKey(
+        SellerPayout,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='ledger_entries'
+    )
+    description = models.CharField(max_length=255)
+    reference_id = models.CharField(max_length=100, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        sign = '+' if self.is_credit else '-'
+        return f"Ledger #{self.id} [{self.seller.name}] {sign}₹{self.amount} ({self.entry_type}) -> Balance: ₹{self.balance_after}"
+
+    @classmethod
+    def get_seller_balance(cls, seller):
+        latest = cls.objects.filter(seller=seller).order_by('-created_at', '-id').first()
+        if latest:
+            return latest.balance_after
+        return Decimal('0.00')
+
+    @classmethod
+    def record(cls, seller, entry_type, amount, is_credit, description, order=None, payout=None, reference_id=''):
+        amount_dec = Decimal(str(amount))
+        current_balance = cls.get_seller_balance(seller)
+        new_balance = current_balance + amount_dec if is_credit else current_balance - amount_dec
+        return cls.objects.create(
+            seller=seller,
+            entry_type=entry_type,
+            amount=amount_dec,
+            is_credit=is_credit,
+            balance_after=new_balance,
+            order=order,
+            payout=payout,
+            description=description,
+            reference_id=reference_id
+        )
 

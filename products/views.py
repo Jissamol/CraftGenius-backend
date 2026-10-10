@@ -13,13 +13,15 @@ from django.db.models import Sum, Avg, Count, Q
 from django.db.models.functions import TruncMonth, TruncDay
 from django.utils import timezone
 from datetime import timedelta
+from decimal import Decimal
 import stripe
 
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
     CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest,
-    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto
+    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto,
+    SellerPayout, SellerLedgerEntry
 )
 from .recommendation_engine import (
     RecommendationEngine, record_product_view, boost_category_interest
@@ -32,7 +34,8 @@ from .serializers import (
     CustomerProfileSerializer, CustomerReviewCreateSerializer,
     ProductDetailSerializer, OrderTimelineSerializer, RefundRequestSerializer,
     PaymentReconciliationSerializer, WorkshopPhotoSerializer,
-    ArtisanStorefrontSerializer
+    ArtisanStorefrontSerializer, SellerLedgerEntrySerializer,
+    SellerPayoutSerializer
 )
 
 
@@ -388,31 +391,172 @@ def artisan_list(request):
 
 # ──────────────────────────── Earnings ──────────────────────────────
 
+def ensure_ledger_backfill(seller):
+    """
+    Guarantees that existing paid orders for a seller are recorded in the
+    SellerLedgerEntry transaction ledger if no entries exist yet.
+    """
+    if not SellerLedgerEntry.objects.filter(seller=seller).exists():
+        paid_orders = Order.objects.filter(seller=seller, is_paid=True).order_by('created_at', 'id')
+        for ord_obj in paid_orders:
+            comm_rate = CommissionSetting.get_rate()
+            comm = (ord_obj.total_amount * comm_rate) / Decimal('100.00')
+            # Record Gross Sale
+            SellerLedgerEntry.record(
+                seller=seller,
+                entry_type='SALE',
+                amount=ord_obj.total_amount,
+                is_credit=True,
+                description=f"Gross Sale for Order #{ord_obj.id} ({ord_obj.product.name})",
+                order=ord_obj,
+                reference_id=ord_obj.stripe_payment_intent or ''
+            )
+            # Record Platform Commission
+            SellerLedgerEntry.record(
+                seller=seller,
+                entry_type='COMMISSION',
+                amount=comm,
+                is_credit=False,
+                description=f"Platform Commission ({comm_rate}%) for Order #{ord_obj.id}",
+                order=ord_obj,
+                reference_id=ord_obj.stripe_payment_intent or ''
+            )
+            # If refunded, record refund deduction
+            if ord_obj.status == 'REFUNDED':
+                net_deduction = ord_obj.total_amount - comm
+                SellerLedgerEntry.record(
+                    seller=seller,
+                    entry_type='REFUND',
+                    amount=net_deduction,
+                    is_credit=False,
+                    description=f"Customer Refund deduction for Order #{ord_obj.id}",
+                    order=ord_obj,
+                    reference_id=f"ref_{ord_obj.id}"
+                )
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def seller_earnings(request):
-    earnings = Earning.objects.filter(seller=request.user)
+    """
+    Provides transparent seller financials and ledger records:
+    - Gross Sales (sum of paid order totals)
+    - Platform Commission (sum of commissions deducted)
+    - Refunds (sum of customer refunds deducted)
+    - Net Earnings (Gross - Commission - Refunds)
+    - Available Withdrawable Balance (Current ledger balance minus pending payouts)
+    - Total Paid Out (Sum of completed payouts)
+    - Pending Payouts (Sum of pending review or processing payouts)
+    - Payout Status Breakdown
+    - Immutable Transaction Ledger Entries
+    - Payout Requests History
+    """
+    seller = request.user
+    ensure_ledger_backfill(seller)
 
-    active_earnings = earnings.exclude(status__in=['CANCELLED', 'REFUNDED'])
-    total = active_earnings.aggregate(
-        total_amount=Sum('amount'),
-        total_commission=Sum('commission'),
-        total_net=Sum('net_amount')
-    )
+    # Calculate financial aggregates from ledger entries
+    ledger_qs = SellerLedgerEntry.objects.filter(seller=seller)
 
-    withdrawable = active_earnings.filter(status='PENDING').aggregate(
-        amount=Sum('net_amount')
-    )['amount'] or 0
+    gross_sales = ledger_qs.filter(entry_type='SALE').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    total_commission = ledger_qs.filter(entry_type='COMMISSION').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    total_refunds = ledger_qs.filter(entry_type='REFUND').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    net_earnings = gross_sales - total_commission - total_refunds
 
-    serializer = EarningSerializer(earnings, many=True, context={'request': request})
+    # Payouts
+    payouts_qs = SellerPayout.objects.filter(seller=seller)
+    total_paid_out = payouts_qs.filter(status='PAID').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    pending_payouts = payouts_qs.filter(status__in=['PENDING', 'PROCESSING']).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+
+    # Available balance = ledger running balance minus reserved pending payouts
+    ledger_balance = SellerLedgerEntry.get_seller_balance(seller)
+    available_balance = max(Decimal('0.00'), ledger_balance - pending_payouts)
+
+    # Payout status breakdown
+    status_choices = ['PENDING', 'PROCESSING', 'PAID', 'REJECTED']
+    payout_breakdown = {}
+    for st in status_choices:
+        filtered = payouts_qs.filter(status=st)
+        payout_breakdown[st] = {
+            'count': filtered.count(),
+            'amount': float(filtered.aggregate(s=Sum('amount'))['s'] or 0)
+        }
+
+    # Serialization
+    ledger_serializer = SellerLedgerEntrySerializer(ledger_qs[:100], many=True)
+    payout_serializer = SellerPayoutSerializer(payouts_qs[:50], many=True)
+    
+    # Legacy earnings for backward compatibility
+    legacy_earnings = Earning.objects.filter(seller=seller)
+    legacy_serializer = EarningSerializer(legacy_earnings, many=True, context={'request': request})
 
     return Response({
-        'total_earnings': total['total_amount'] or 0,
-        'total_commission': total['total_commission'] or 0,
-        'total_net': total['total_net'] or 0,
-        'withdrawable': withdrawable,
-        'history': serializer.data
+        'gross_sales': float(gross_sales),
+        'total_commission': float(total_commission),
+        'total_refunds': float(total_refunds),
+        'net_earnings': float(net_earnings),
+        'available_balance': float(available_balance),
+        'total_paid_out': float(total_paid_out),
+        'pending_payouts': float(pending_payouts),
+        'payout_status_breakdown': payout_breakdown,
+        'ledger_entries': ledger_serializer.data,
+        'payouts': payout_serializer.data,
+        
+        # Backward compatibility aliases
+        'total_earnings': float(gross_sales),
+        'total_net': float(net_earnings),
+        'withdrawable': float(available_balance),
+        'history': legacy_serializer.data
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def request_payout(request):
+    """
+    Artisan requests a payout withdrawal against their available balance.
+    """
+    seller = request.user
+    ensure_ledger_backfill(seller)
+
+    try:
+        amount = Decimal(str(request.data.get('amount', 0)))
+    except Exception:
+        return Response({'detail': 'Please provide a valid payout amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if amount <= Decimal('0.00'):
+        return Response({'detail': 'Payout amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payouts_qs = SellerPayout.objects.filter(seller=seller)
+    pending_payouts = payouts_qs.filter(status__in=['PENDING', 'PROCESSING']).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    ledger_balance = SellerLedgerEntry.get_seller_balance(seller)
+    available_balance = max(Decimal('0.00'), ledger_balance - pending_payouts)
+
+    if amount > available_balance:
+        return Response({
+            'detail': f'Requested amount (₹{amount}) exceeds your available balance (₹{available_balance:.2f}).'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    payout_method = request.data.get('payout_method', 'BANK_TRANSFER')
+    account_details = request.data.get('account_details', '').strip()
+    notes = request.data.get('notes', '').strip()
+
+    if not account_details:
+        return Response({'detail': 'Account details (e.g. Bank Account / IFSC or UPI ID) are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payout = SellerPayout.objects.create(
+        seller=seller,
+        amount=amount,
+        status='PENDING',
+        payout_method=payout_method,
+        account_details=account_details,
+        notes=notes
+    )
+
+    return Response({
+        'detail': f'Payout request of ₹{amount} submitted successfully! Processing time: 1-3 business days.',
+        'payout': SellerPayoutSerializer(payout).data
+    }, status=status.HTTP_201_CREATED)
+
 
 
 # ──────────────────────────── Analytics ─────────────────────────────
@@ -842,6 +986,21 @@ def cancel_order(request, pk):
         if hasattr(order, 'earning'):
             order.earning.status = 'CANCELLED'
             order.earning.save()
+
+        # Record refund deduction in transaction ledger
+        comm_rate = CommissionSetting.get_rate()
+        comm = (order.total_amount * comm_rate) / Decimal('100.00')
+        net_refund_deduction = order.total_amount - comm
+        if not SellerLedgerEntry.objects.filter(order=order, entry_type='REFUND').exists():
+            SellerLedgerEntry.record(
+                seller=order.seller,
+                entry_type='REFUND',
+                amount=net_refund_deduction,
+                is_credit=False,
+                description=f"Customer Refund deduction for cancelled Order #{order.id}",
+                order=order,
+                reference_id=refund_id
+            )
     else:
         order.status = 'CANCELLED'
 

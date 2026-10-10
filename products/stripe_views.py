@@ -5,7 +5,7 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from .models import Product, Order, CommissionSetting, Earning
+from .models import Product, Order, CommissionSetting, Earning, SellerLedgerEntry
 from .recommendation_engine import boost_category_interest
 from decimal import Decimal
 import os
@@ -191,6 +191,27 @@ def stripe_webhook(request):
                         'status': 'PENDING'
                     }
                 )
+
+                # Record in Seller Financial Transaction Ledger
+                if not SellerLedgerEntry.objects.filter(order=order, entry_type='SALE').exists():
+                    SellerLedgerEntry.record(
+                        seller=order.seller,
+                        entry_type='SALE',
+                        amount=order.total_amount,
+                        is_credit=True,
+                        description=f"Gross Sale for Order #{order.id} ({order.product.name})",
+                        order=order,
+                        reference_id=payment_intent or order.stripe_payment_intent or ''
+                    )
+                    SellerLedgerEntry.record(
+                        seller=order.seller,
+                        entry_type='COMMISSION',
+                        amount=commission,
+                        is_credit=False,
+                        description=f"Platform Commission ({commission_rate}%) for Order #{order.id}",
+                        order=order,
+                        reference_id=payment_intent or order.stripe_payment_intent or ''
+                    )
                 
                 # Reduce stock
                 product = order.product
@@ -268,6 +289,27 @@ def payment_success_view(request):
                             'status': 'PENDING'
                         }
                     )
+
+                    # Record in Seller Financial Transaction Ledger
+                    if not SellerLedgerEntry.objects.filter(order=order, entry_type='SALE').exists():
+                        SellerLedgerEntry.record(
+                            seller=order.seller,
+                            entry_type='SALE',
+                            amount=order.total_amount,
+                            is_credit=True,
+                            description=f"Gross Sale for Order #{order.id} ({order.product.name})",
+                            order=order,
+                            reference_id=order.stripe_payment_intent or session_id
+                        )
+                        SellerLedgerEntry.record(
+                            seller=order.seller,
+                            entry_type='COMMISSION',
+                            amount=commission,
+                            is_credit=False,
+                            description=f"Platform Commission ({commission_rate}%) for Order #{order.id}",
+                            order=order,
+                            reference_id=order.stripe_payment_intent or session_id
+                        )
                     
                     # Stock reduction (atomicity check)
                     product = order.product

@@ -34,8 +34,9 @@ urlpatterns = [
     path('artisan/<int:pk>/', views.artisan_storefront, name='artisan-storefront'),
     path('artisans/', views.artisan_list, name='artisan-list'),
 
-    # Earnings
+    # Earnings & Payouts
     path('seller/earnings/', views.seller_earnings, name='seller-earnings'),
+    path('seller/payouts/request/', views.request_payout, name='seller-request-payout'),
 
     # Analytics
     path('seller/analytics/', views.seller_analytics, name='seller-analytics'),
@@ -124,4 +125,8 @@ urlpatterns = [
 
     # Commission
     path('admin/commission/', admin_views.admin_commission, name='admin-commission'),
+
+    # Payouts
+    path('admin/payouts/', admin_views.admin_payout_list, name='admin-payout-list'),
+    path('admin/payouts/<int:pk>/process/', admin_views.admin_process_payout, name='admin-process-payout'),
 ]

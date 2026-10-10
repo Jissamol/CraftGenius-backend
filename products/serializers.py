@@ -2,7 +2,8 @@ from rest_framework import serializers
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
-    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto
+    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto,
+    SellerPayout, SellerLedgerEntry
 )
 
 
@@ -403,4 +404,36 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             return Wishlist.objects.filter(user=request.user, product=obj).exists()
         return False
+
+
+class SellerLedgerEntrySerializer(serializers.ModelSerializer):
+    order_id = serializers.IntegerField(source='order.id', read_only=True)
+    product_name = serializers.CharField(source='order.product.name', read_only=True)
+    payout_id = serializers.IntegerField(source='payout.id', read_only=True)
+    entry_type_display = serializers.CharField(source='get_entry_type_display', read_only=True)
+
+    class Meta:
+        model = SellerLedgerEntry
+        fields = [
+            'id', 'entry_type', 'entry_type_display', 'amount', 'is_credit', 'balance_after',
+            'description', 'reference_id', 'order_id', 'product_name',
+            'payout_id', 'created_at'
+        ]
+
+
+class SellerPayoutSerializer(serializers.ModelSerializer):
+    seller_name = serializers.CharField(source='seller.name', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    payout_method_display = serializers.CharField(source='get_payout_method_display', read_only=True)
+
+    class Meta:
+        model = SellerPayout
+        fields = [
+            'id', 'amount', 'status', 'status_display',
+            'payout_method', 'payout_method_display',
+            'account_details', 'reference_id',
+            'requested_at', 'processed_at', 'notes',
+            'seller_name'
+        ]
+        read_only_fields = ['id', 'status', 'reference_id', 'requested_at', 'processed_at', 'seller_name']
 
