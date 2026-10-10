@@ -25,8 +25,14 @@ urlpatterns = [
     path('reviews/seller/', views.seller_reviews, name='seller-reviews'),
     path('reviews/<int:pk>/reply/', views.reply_to_review, name='reply-to-review'),
 
-    # Seller Profile
+    # Seller Profile & Workshop Photos
     path('seller/profile/', views.seller_profile, name='seller-profile'),
+    path('seller/workshop-photos/', views.add_workshop_photo, name='add-workshop-photo'),
+    path('seller/workshop-photos/<int:pk>/', views.delete_workshop_photo, name='delete-workshop-photo'),
+
+    # Public Artisan Storefronts
+    path('artisan/<int:pk>/', views.artisan_storefront, name='artisan-storefront'),
+    path('artisans/', views.artisan_list, name='artisan-list'),
 
     # Earnings
     path('seller/earnings/', views.seller_earnings, name='seller-earnings'),

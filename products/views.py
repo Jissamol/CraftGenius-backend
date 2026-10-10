@@ -19,7 +19,7 @@ from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
     CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest,
-    OrderTimeline, RefundRequest, PaymentReconciliation
+    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto
 )
 from .recommendation_engine import (
     RecommendationEngine, record_product_view, boost_category_interest
@@ -31,7 +31,8 @@ from .serializers import (
     CartSerializer, CartItemSerializer, WishlistSerializer,
     CustomerProfileSerializer, CustomerReviewCreateSerializer,
     ProductDetailSerializer, OrderTimelineSerializer, RefundRequestSerializer,
-    PaymentReconciliationSerializer
+    PaymentReconciliationSerializer, WorkshopPhotoSerializer,
+    ArtisanStorefrontSerializer
 )
 
 
@@ -289,6 +290,100 @@ def seller_profile(request):
             
         return Response(SellerProfileSerializer(profile, context={'request': request}).data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def add_workshop_photo(request):
+    profile, _ = SellerProfile.objects.get_or_create(user=request.user)
+    image = request.FILES.get('image')
+    if not image:
+        return Response({'detail': 'Image is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    caption = request.data.get('caption', '')
+    photo = WorkshopPhoto.objects.create(seller_profile=profile, image=image, caption=caption)
+    serializer = WorkshopPhotoSerializer(photo, context={'request': request})
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_workshop_photo(request, pk):
+    try:
+        photo = WorkshopPhoto.objects.get(pk=pk, seller_profile__user=request.user)
+        photo.delete()
+        return Response({'detail': 'Workshop photo removed.'})
+    except WorkshopPhoto.DoesNotExist:
+        return Response({'detail': 'Photo not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def artisan_storefront(request, pk):
+    """Public Storefront API for an artisan with bio, craft story, workshop photos, products, and reviews."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        artisan_user = User.objects.get(id=pk, role='HANDICRAFTER')
+    except User.DoesNotExist:
+        return Response({'detail': 'Artisan not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    profile, _ = SellerProfile.objects.get_or_create(user=artisan_user)
+    profile_data = ArtisanStorefrontSerializer(profile, context={'request': request}).data
+
+    # Products by this artisan
+    products_qs = Product.objects.filter(seller=artisan_user, is_active=True, is_approved=True).select_related('category')
+    
+    cat_param = request.query_params.get('category')
+    if cat_param:
+        products_qs = products_qs.filter(category_id=cat_param)
+
+    sort = request.query_params.get('sort', 'newest')
+    if sort == 'price_low':
+        products_qs = products_qs.order_by('price')
+    elif sort == 'price_high':
+        products_qs = products_qs.order_by('-price')
+    else:
+        products_qs = products_qs.order_by('-created_at')
+
+    products_data = ProductSerializer(products_qs, many=True, context={'request': request}).data
+
+    # Reviews received across all this artisan's products
+    reviews_qs = Review.objects.filter(product__seller=artisan_user).select_related('customer', 'product').order_by('-created_at')[:30]
+    reviews_data = ReviewSerializer(reviews_qs, many=True, context={'request': request}).data
+
+    # Distinct categories
+    categories = Category.objects.filter(products__seller=artisan_user, products__is_active=True, products__is_approved=True).distinct()
+    categories_data = CategorySerializer(categories, many=True, context={'request': request}).data
+
+    return Response({
+        'artisan': profile_data,
+        'products': products_data,
+        'reviews': reviews_data,
+        'categories': categories_data
+    })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def artisan_list(request):
+    """List of all public verified artisans."""
+    artisans = SellerProfile.objects.filter(
+        user__role='HANDICRAFTER',
+        user__is_approved=True
+    ).select_related('user').prefetch_related('workshop_photos')
+
+    search = request.query_params.get('search', '').strip()
+    if search:
+        artisans = artisans.filter(
+            Q(user__name__icontains=search) |
+            Q(craft_specialty__icontains=search) |
+            Q(location__icontains=search) |
+            Q(bio__icontains=search)
+        )
+
+    serializer = ArtisanStorefrontSerializer(artisans, many=True, context={'request': request})
+    return Response(serializer.data)
 
 
 # ──────────────────────────── Earnings ──────────────────────────────

@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
-    OrderTimeline, RefundRequest, PaymentReconciliation
+    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto
 )
 
 
@@ -166,6 +166,21 @@ class ReviewReplySerializer(serializers.Serializer):
     seller_reply = serializers.CharField()
 
 
+class WorkshopPhotoSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkshopPhoto
+        fields = ['id', 'image', 'image_url', 'caption', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def get_image_url(self, obj):
+        request = self.context.get('request')
+        if obj.image:
+            return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+        return None
+
+
 class SellerProfileSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='user.name', read_only=True)
     email = serializers.CharField(source='user.email', read_only=True)
@@ -173,8 +188,8 @@ class SellerProfileSerializer(serializers.ModelSerializer):
     address = serializers.CharField(source='user.address', read_only=True)
     role = serializers.CharField(source='user.role', read_only=True)
     is_approved = serializers.BooleanField(source='user.is_approved', read_only=True)
+    workshop_photos = WorkshopPhotoSerializer(many=True, read_only=True)
 
-    # Use the user's profile picture if the seller profile doesn't have one
     def get_profile_picture(self, obj):
         request = self.context.get('request')
         if obj.profile_picture:
@@ -183,15 +198,78 @@ class SellerProfileSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(obj.user.profile_picture.url) if request else obj.user.profile_picture.url
         return None
 
+    def get_cover_banner_url(self, obj):
+        request = self.context.get('request')
+        if obj.cover_banner:
+            return request.build_absolute_uri(obj.cover_banner.url) if request else obj.cover_banner.url
+        return None
+
     profile_picture_url = serializers.SerializerMethodField(method_name='get_profile_picture')
+    cover_banner_url = serializers.SerializerMethodField(method_name='get_cover_banner_url')
 
     class Meta:
         model = SellerProfile
         fields = [
             'id', 'name', 'email', 'phone_number', 'address', 'role', 'is_approved',
-            'bio', 'profile_picture', 'profile_picture_url', 'craft_specialty', 'location', 'social_links',
-            'created_at', 'updated_at'
+            'bio', 'craft_story', 'profile_picture', 'profile_picture_url',
+            'cover_banner', 'cover_banner_url', 'craft_specialty',
+            'workshop_headline', 'years_of_experience', 'techniques_used',
+            'materials_used', 'badge_label', 'location', 'social_links',
+            'workshop_photos', 'created_at', 'updated_at'
         ]
+
+
+class ArtisanStorefrontSerializer(serializers.ModelSerializer):
+    seller_id = serializers.IntegerField(source='user.id', read_only=True)
+    name = serializers.CharField(source='user.name', read_only=True)
+    is_verified = serializers.BooleanField(source='user.is_approved', read_only=True)
+    member_since = serializers.DateTimeField(source='user.created_at', read_only=True)
+    workshop_photos = WorkshopPhotoSerializer(many=True, read_only=True)
+    profile_picture_url = serializers.SerializerMethodField()
+    cover_banner_url = serializers.SerializerMethodField()
+    total_products = serializers.SerializerMethodField()
+    average_rating = serializers.SerializerMethodField()
+    total_reviews = serializers.SerializerMethodField()
+    fulfilled_orders = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SellerProfile
+        fields = [
+            'id', 'seller_id', 'name', 'is_verified', 'member_since',
+            'bio', 'craft_story', 'profile_picture_url', 'cover_banner_url',
+            'craft_specialty', 'workshop_headline', 'years_of_experience',
+            'techniques_used', 'materials_used', 'badge_label', 'location',
+            'social_links', 'workshop_photos', 'total_products',
+            'average_rating', 'total_reviews', 'fulfilled_orders'
+        ]
+
+    def get_profile_picture_url(self, obj):
+        request = self.context.get('request')
+        if obj.profile_picture:
+            return request.build_absolute_uri(obj.profile_picture.url) if request else obj.profile_picture.url
+        elif obj.user.profile_picture:
+            return request.build_absolute_uri(obj.user.profile_picture.url) if request else obj.user.profile_picture.url
+        return None
+
+    def get_cover_banner_url(self, obj):
+        request = self.context.get('request')
+        if obj.cover_banner:
+            return request.build_absolute_uri(obj.cover_banner.url) if request else obj.cover_banner.url
+        return None
+
+    def get_total_products(self, obj):
+        return obj.user.products.filter(is_active=True, is_approved=True).count()
+
+    def get_fulfilled_orders(self, obj):
+        return obj.user.seller_orders.filter(status='DELIVERED').count()
+
+    def get_average_rating(self, obj):
+        from django.db.models import Avg
+        avg = Review.objects.filter(product__seller=obj.user).aggregate(avg=Avg('rating'))['avg']
+        return round(float(avg), 1) if avg else 5.0
+
+    def get_total_reviews(self, obj):
+        return Review.objects.filter(product__seller=obj.user).count()
 
 
 class EarningSerializer(serializers.ModelSerializer):

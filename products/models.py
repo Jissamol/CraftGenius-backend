@@ -347,8 +347,15 @@ class SellerProfile(models.Model):
         related_name='seller_profile'
     )
     bio = models.TextField(blank=True, default='')
+    craft_story = models.TextField(blank=True, default='')
     profile_picture = models.ImageField(upload_to='profiles/', blank=True, null=True)
+    cover_banner = models.ImageField(upload_to='banners/', blank=True, null=True)
     craft_specialty = models.CharField(max_length=200, blank=True, default='')
+    workshop_headline = models.CharField(max_length=200, blank=True, default='')
+    years_of_experience = models.PositiveIntegerField(default=1)
+    techniques_used = models.CharField(max_length=300, blank=True, default='')
+    materials_used = models.CharField(max_length=300, blank=True, default='')
+    badge_label = models.CharField(max_length=100, blank=True, default='Master Artisan')
     location = models.CharField(max_length=200, blank=True, default='')
     social_links = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -356,6 +363,23 @@ class SellerProfile(models.Model):
 
     def __str__(self):
         return f"Profile of {self.user.name}"
+
+
+class WorkshopPhoto(models.Model):
+    seller_profile = models.ForeignKey(
+        SellerProfile,
+        on_delete=models.CASCADE,
+        related_name='workshop_photos'
+    )
+    image = models.ImageField(upload_to='workshops/')
+    caption = models.CharField(max_length=255, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Workshop photo for {self.seller_profile.user.name}"
 
 
 class Earning(models.Model):

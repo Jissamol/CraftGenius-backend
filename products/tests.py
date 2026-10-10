@@ -188,3 +188,27 @@ class OrderManagementTests(TestCase):
         self.assertEqual(earning.status, 'REFUNDED')
         self.assertEqual(recon.gateway_status, 'SUCCEEDED')
         self.assertTrue(recon.is_reconciled)
+
+    def test_artisan_storefront(self):
+        """Test public artisan storefront data and craft stories."""
+        from products.models import SellerProfile, WorkshopPhoto
+        profile, _ = SellerProfile.objects.get_or_create(
+            user=self.seller,
+            defaults={
+                'bio': 'Passionate heritage woodworker from Kerala.',
+                'craft_story': 'Learned the art of woodcarving from three generations of master crafters.',
+                'craft_specialty': 'Teakwood & Rosewood Carving',
+                'workshop_headline': 'Heritage Wood Studio, Calicut',
+                'years_of_experience': 14,
+                'techniques_used': 'Hand-chiseling, Natural Wax Polishing',
+                'materials_used': 'Sustainable Teakwood, Natural Beeswax'
+            }
+        )
+
+        response = self.client.get(f'/api/artisan/{self.seller.id}/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['artisan']['name'], 'Test Seller')
+        self.assertTrue(data['artisan']['is_verified'])
+        self.assertEqual(len(data['products']), 1)
+        self.assertEqual(data['products'][0]['name'], 'Handmade Bowl')
