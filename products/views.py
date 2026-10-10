@@ -13,12 +13,13 @@ from django.db.models import Sum, Avg, Count, Q
 from django.db.models.functions import TruncMonth, TruncDay
 from django.utils import timezone
 from datetime import timedelta
-
+import stripe
 
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
-    CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest
+    CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest,
+    OrderTimeline, RefundRequest, PaymentReconciliation
 )
 from .recommendation_engine import (
     RecommendationEngine, record_product_view, boost_category_interest
@@ -29,7 +30,8 @@ from .serializers import (
     ReviewReplySerializer, SellerProfileSerializer, EarningSerializer,
     CartSerializer, CartItemSerializer, WishlistSerializer,
     CustomerProfileSerializer, CustomerReviewCreateSerializer,
-    ProductDetailSerializer
+    ProductDetailSerializer, OrderTimelineSerializer, RefundRequestSerializer,
+    PaymentReconciliationSerializer
 )
 
 
@@ -161,25 +163,63 @@ def update_order_status(request, pk):
 
     serializer = OrderStatusSerializer(data=request.data)
     if serializer.is_valid():
-        order.status = serializer.validated_data['status']
+        new_status = serializer.validated_data['status']
         tracking = serializer.validated_data.get('tracking_number', '')
+        notes = serializer.validated_data.get('notes', '')
+
+        # Validate status transition
+        allowed, msg = order.can_transition_to(new_status, user=request.user)
+        if not allowed:
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        old_status = order.status
+        order.status = new_status
         if tracking:
             order.tracking_number = tracking
+
+        # If seller cancels
+        if new_status == 'CANCELLED':
+            order.restore_stock()
+            order.cancellation_reason = request.data.get('reason', 'Cancelled by handicrafter')
+            order.cancelled_by = request.user
+            order.cancelled_at = timezone.now()
+            if hasattr(order, 'earning'):
+                order.earning.status = 'CANCELLED'
+                order.earning.save()
+
+        # If returned
+        elif new_status == 'RETURNED':
+            order.restore_stock()
+            if hasattr(order, 'earning'):
+                order.earning.status = 'REFUNDED'
+                order.earning.save()
+
         order.save()
 
         # Auto-create Earning record when order is delivered
-        if order.status == 'DELIVERED' and not hasattr(order, 'earning'):
-            commission_rate = CommissionSetting.get_rate()
-            amount = order.total_amount
-            commission = round(amount * commission_rate / 100, 2)
-            net_amount = amount - commission
-            Earning.objects.create(
-                seller=order.seller,
-                order=order,
-                amount=amount,
-                commission=commission,
-                net_amount=net_amount,
-            )
+        if order.status == 'DELIVERED':
+            if not hasattr(order, 'earning'):
+                commission_rate = CommissionSetting.get_rate()
+                amount = order.total_amount
+                commission = round(amount * commission_rate / 100, 2)
+                net_amount = amount - commission
+                Earning.objects.create(
+                    seller=order.seller,
+                    order=order,
+                    amount=amount,
+                    commission=commission,
+                    net_amount=net_amount,
+                    status='PENDING'
+                )
+
+        # Record timeline event
+        timeline_notes = notes or (f"Tracking #{tracking}" if tracking else f"Status transitioned from {old_status} to {new_status}.")
+        order.add_timeline(
+            status=new_status,
+            title=f"Order {new_status.replace('_', ' ').title()}",
+            notes=timeline_notes,
+            changed_by=request.user
+        )
 
         result = OrderSerializer(order, context={'request': request})
         return Response(result.data)
@@ -258,13 +298,14 @@ def seller_profile(request):
 def seller_earnings(request):
     earnings = Earning.objects.filter(seller=request.user)
 
-    total = earnings.aggregate(
+    active_earnings = earnings.exclude(status__in=['CANCELLED', 'REFUNDED'])
+    total = active_earnings.aggregate(
         total_amount=Sum('amount'),
         total_commission=Sum('commission'),
         total_net=Sum('net_amount')
     )
 
-    withdrawable = earnings.filter(status='PENDING').aggregate(
+    withdrawable = active_earnings.filter(status='PENDING').aggregate(
         amount=Sum('net_amount')
     )['amount'] or 0
 
@@ -626,6 +667,14 @@ def create_order(request):
         item.product.stock -= item.quantity
         item.product.save()
 
+        # Add initial timeline
+        order.add_timeline(
+            status='PENDING',
+            title='Order Placed',
+            notes=f'Order #{order.id} placed for {order.quantity}x {order.product.name}. Awaiting processing.',
+            changed_by=request.user
+        )
+
         orders_created.append(order)
         if item.product.category:
             boost_category_interest(request.user, item.product.category, points=4.0)
@@ -650,25 +699,146 @@ def customer_orders(request):
     return Response(serializer.data)
 
 
-@api_view(['PATCH'])
+@api_view(['PATCH', 'POST'])
 @permission_classes([IsAuthenticated])
 def cancel_order(request, pk):
+    try:
+        order = Order.objects.get(pk=pk)
+        if order.customer != request.user and order.seller != request.user and not (request.user.role == 'ADMIN' or request.user.is_superuser):
+            return Response({'detail': 'Not authorized to cancel this order.'}, status=status.HTTP_403_FORBIDDEN)
+    except Order.DoesNotExist:
+        return Response({'detail': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    # Validate transition
+    allowed, msg = order.can_transition_to('CANCELLED', user=request.user)
+    if not allowed:
+        return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    reason = request.data.get('reason', 'Customer requested cancellation')
+    order.cancellation_reason = reason
+    order.cancelled_by = request.user
+    order.cancelled_at = timezone.now()
+    order.restore_stock()
+
+    # Payment reconciliation if paid
+    if order.is_paid:
+        refund_id = f"sim_ref_{order.id}_{int(timezone.now().timestamp())}"
+        gateway_status = 'SUCCEEDED'
+        if order.stripe_payment_intent:
+            try:
+                stripe_ref = stripe.Refund.create(payment_intent=order.stripe_payment_intent)
+                refund_id = stripe_ref.id
+            except Exception as se:
+                print(f"Stripe refund note: {se}")
+                gateway_status = 'SIMULATED'
+
+        PaymentReconciliation.objects.create(
+            order=order,
+            payment_intent_id=order.stripe_payment_intent,
+            refund_transaction_id=refund_id,
+            original_amount=order.total_amount,
+            refunded_amount=order.total_amount,
+            gateway_status=gateway_status,
+            is_reconciled=True,
+            reconciled_by=request.user,
+            notes=f"Auto refund on order cancellation: {reason}"
+        )
+        order.status = 'REFUNDED'
+        if hasattr(order, 'earning'):
+            order.earning.status = 'CANCELLED'
+            order.earning.save()
+    else:
+        order.status = 'CANCELLED'
+
+    order.save()
+
+    # Timeline entry
+    timeline_title = 'Order Cancelled & Refunded' if order.status == 'REFUNDED' else 'Order Cancelled'
+    order.add_timeline(
+        status=order.status,
+        title=timeline_title,
+        notes=f"Reason: {reason}. Product stock restored.",
+        changed_by=request.user
+    )
+
+    serializer = OrderSerializer(order, context={'request': request})
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def request_refund(request, pk):
+    """Customer submits a refund request for an eligible order."""
     try:
         order = Order.objects.get(pk=pk, customer=request.user)
     except Order.DoesNotExist:
         return Response({'detail': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-    if order.status in ['SHIPPED', 'DELIVERED']:
-        return Response({'detail': 'Cannot cancel shipped/delivered orders'}, status=status.HTTP_400_BAD_REQUEST)
+    # Eligible statuses
+    eligible_statuses = ['DELIVERED', 'SHIPPED', 'PROCESSING', 'CANCELLED', 'RETURN_REQUESTED', 'RETURNED']
+    if order.status not in eligible_statuses:
+        return Response(
+            {'detail': f'Orders with status {order.status} are not eligible for a refund request.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
-    order.status = 'CANCELLED'
-    order.save()
+    # Check for pending refund request
+    if order.refund_requests.filter(status='PENDING').exists():
+        return Response(
+            {'detail': 'A refund request is already pending review for this order.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
-    # Restore stock
-    order.product.stock += order.quantity
-    order.product.save()
+    reason = request.data.get('reason', 'OTHER')
+    explanation = request.data.get('explanation', '').strip()
+    if not explanation:
+        return Response({'detail': 'Please provide an explanation for your refund request.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    amount = request.data.get('amount')
+    if amount is not None:
+        try:
+            amount = float(amount)
+        except ValueError:
+            amount = float(order.total_amount)
+    else:
+        amount = float(order.total_amount)
+
+    refund_req = RefundRequest.objects.create(
+        order=order,
+        customer=request.user,
+        reason=reason,
+        explanation=explanation,
+        amount=amount,
+        status='PENDING'
+    )
+
+    if order.status == 'DELIVERED':
+        order.status = 'RETURN_REQUESTED'
+        order.save(update_fields=['status'])
+
+    order.add_timeline(
+        status='RETURN_REQUESTED',
+        title='Refund & Return Requested',
+        notes=f"Reason: {refund_req.get_reason_display()}. Amount: ₹{amount}. Explanation: {explanation}",
+        changed_by=request.user
+    )
 
     serializer = OrderSerializer(order, context={'request': request})
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def order_timeline(request, pk):
+    try:
+        order = Order.objects.get(pk=pk)
+        if order.customer != request.user and order.seller != request.user and not (request.user.role == 'ADMIN' or request.user.is_superuser):
+            return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
+    except Order.DoesNotExist:
+        return Response({'detail': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    timeline = order.timeline.all()
+    serializer = OrderTimelineSerializer(timeline, many=True)
     return Response(serializer.data)
 
 

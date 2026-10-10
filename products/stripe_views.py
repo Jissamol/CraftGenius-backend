@@ -78,7 +78,7 @@ def create_checkout_session(request):
 
         # Create PENDING orders in DB immediately
         if product_id:
-            Order.objects.create(
+            order = Order.objects.create(
                 customer=request.user,
                 product=product,
                 seller=product.seller,
@@ -88,6 +88,12 @@ def create_checkout_session(request):
                 is_paid=False,
                 stripe_session_id=checkout_session.id
             )
+            order.add_timeline(
+                status='PENDING',
+                title='Order Placed',
+                notes='Checkout session initiated. Awaiting payment.',
+                changed_by=request.user
+            )
             if product.category:
                 boost_category_interest(request.user, product.category, points=4.0)
         else:
@@ -95,7 +101,7 @@ def create_checkout_session(request):
             from .models import Cart
             cart = Cart.objects.get(user=request.user)
             for item in cart.items.all():
-                Order.objects.create(
+                order = Order.objects.create(
                     customer=request.user,
                     product=item.product,
                     seller=item.product.seller,
@@ -104,6 +110,12 @@ def create_checkout_session(request):
                     status='PENDING',
                     is_paid=False,
                     stripe_session_id=checkout_session.id
+                )
+                order.add_timeline(
+                    status='PENDING',
+                    title='Order Placed',
+                    notes='Checkout session initiated for cart item. Awaiting payment.',
+                    changed_by=request.user
                 )
                 if item.product.category:
                     boost_category_interest(request.user, item.product.category, points=4.0)
@@ -156,6 +168,13 @@ def stripe_webhook(request):
                 order.status = 'PROCESSING'
                 order.stripe_payment_intent = payment_intent
                 order.save()
+
+                order.add_timeline(
+                    status='PROCESSING',
+                    title='Payment Confirmed',
+                    notes=f'Payment successful via Stripe Checkout (Intent: {payment_intent}). Order is now processing.',
+                    changed_by=order.customer
+                )
                 
                 # Calculate and create Earning
                 commission_rate = CommissionSetting.get_rate()
@@ -195,6 +214,12 @@ def stripe_webhook(request):
             for order in orders:
                 order.status = 'FAILED'
                 order.save()
+                order.add_timeline(
+                    status='FAILED',
+                    title='Payment Expired / Cancelled',
+                    notes='Stripe checkout session expired or payment attempt failed.',
+                    changed_by=order.customer
+                )
         except Exception as e:
             print(f"Error processing failed webhook for session {session_id}: {e}")
 
@@ -221,6 +246,12 @@ def payment_success_view(request):
                     order.status = 'PROCESSING'
                     order.stripe_payment_intent = session.payment_intent
                     order.save()
+                    order.add_timeline(
+                        status='PROCESSING',
+                        title='Payment Confirmed',
+                        notes=f'Payment verified via Stripe Checkout session {session_id[:16]}... Order is now processing.',
+                        changed_by=request.user
+                    )
                     
                     # Calculate and create Earning
                     commission_rate = CommissionSetting.get_rate()

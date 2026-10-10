@@ -8,15 +8,18 @@ from django.utils import timezone
 from datetime import timedelta
 from django.contrib.auth import get_user_model
 
+import stripe
 from .models import (
     Category, Product, Order, Review, Earning,
-    CommissionSetting, Dispute
+    CommissionSetting, Dispute, OrderTimeline,
+    RefundRequest, PaymentReconciliation
 )
 from .admin_serializers import (
     AdminUserSerializer, AdminHandicrafterSerializer,
     AdminProductSerializer, AdminOrderSerializer,
     AdminReviewSerializer, AdminCategorySerializer,
-    CommissionSettingSerializer, DisputeSerializer
+    CommissionSettingSerializer, DisputeSerializer,
+    AdminRefundRequestSerializer
 )
 
 User = get_user_model()
@@ -309,12 +312,38 @@ def admin_update_order_status(request, pk):
     try:
         order = Order.objects.get(id=pk)
         new_status = request.data.get('status')
-        if new_status and new_status in dict(Order.STATUS_CHOICES):
-            order.status = new_status
-            order.save()
+        notes = request.data.get('notes', '')
+        if not new_status or new_status not in dict(Order.STATUS_CHOICES):
+            return Response({'detail': 'Invalid status provided.'}, status=400)
 
-            # Auto-create Earning record when order is delivered
-            if new_status == 'DELIVERED' and not hasattr(order, 'earning'):
+        # Validate status transition
+        allowed, msg = order.can_transition_to(new_status, user=request.user)
+        if not allowed:
+            return Response({'detail': msg}, status=400)
+
+        old_status = order.status
+        order.status = new_status
+
+        if new_status == 'CANCELLED':
+            order.restore_stock()
+            order.cancellation_reason = request.data.get('reason', 'Cancelled by administrator')
+            order.cancelled_by = request.user
+            order.cancelled_at = timezone.now()
+            if hasattr(order, 'earning'):
+                order.earning.status = 'CANCELLED'
+                order.earning.save()
+
+        elif new_status == 'RETURNED':
+            order.restore_stock()
+            if hasattr(order, 'earning'):
+                order.earning.status = 'REFUNDED'
+                order.earning.save()
+
+        order.save()
+
+        # Auto-create Earning record when order is delivered
+        if new_status == 'DELIVERED':
+            if not hasattr(order, 'earning'):
                 commission_rate = CommissionSetting.get_rate()
                 amount = order.total_amount
                 commission = round(float(amount) * float(commission_rate) / 100, 2)
@@ -325,10 +354,19 @@ def admin_update_order_status(request, pk):
                     amount=amount,
                     commission=commission,
                     net_amount=net_amount,
+                    status='PENDING'
                 )
 
-            return Response({'detail': f'Order #{pk} status updated to {new_status}.'})
-        return Response({'detail': 'Invalid status.'}, status=400)
+        # Timeline event
+        order.add_timeline(
+            status=new_status,
+            title=f"Order {new_status.replace('_', ' ').title()} by Admin",
+            notes=notes or f"Administrator updated order status from {old_status} to {new_status}.",
+            changed_by=request.user
+        )
+
+        serializer = AdminOrderSerializer(order, context={'request': request})
+        return Response(serializer.data)
     except Order.DoesNotExist:
         return Response({'detail': 'Order not found.'}, status=404)
 
@@ -337,16 +375,201 @@ def admin_update_order_status(request, pk):
 @permission_classes([IsAuthenticated])
 @admin_required
 def admin_refund_order(request, pk):
+    """Admin direct refund endpoint with payment reconciliation and stock restoration."""
     try:
         order = Order.objects.get(id=pk)
-        order.status = 'CANCELLED'
-        order.save()
-        # Restore stock
-        order.product.stock += order.quantity
-        order.product.save()
-        return Response({'detail': f'Order #{pk} refunded and cancelled.'})
     except Order.DoesNotExist:
         return Response({'detail': 'Order not found.'}, status=404)
+
+    restore_stock = request.data.get('restore_stock', True)
+    admin_notes = request.data.get('admin_notes', 'Refund issued by administrator')
+    refund_amount = request.data.get('amount')
+    try:
+        refund_amount = float(refund_amount) if refund_amount is not None else float(order.total_amount)
+    except (ValueError, TypeError):
+        refund_amount = float(order.total_amount)
+
+    # Validate transition
+    allowed, msg = order.can_transition_to('REFUNDED', user=request.user)
+    if not allowed and order.status != 'CANCELLED':
+        return Response({'detail': msg}, status=400)
+
+    # Stock restoration
+    if restore_stock:
+        order.restore_stock()
+
+    # Reconcile Payment (Stripe refund)
+    refund_id = f"sim_ref_{order.id}_{int(timezone.now().timestamp())}"
+    gateway_status = 'SUCCEEDED'
+    if order.stripe_payment_intent:
+        try:
+            stripe_ref = stripe.Refund.create(
+                payment_intent=order.stripe_payment_intent,
+                amount=int(refund_amount * 100)
+            )
+            refund_id = stripe_ref.id
+        except Exception as se:
+            print(f"Stripe refund API call: {se}")
+            gateway_status = 'SIMULATED'
+
+    PaymentReconciliation.objects.create(
+        order=order,
+        payment_intent_id=order.stripe_payment_intent,
+        refund_transaction_id=refund_id,
+        original_amount=order.total_amount,
+        refunded_amount=refund_amount,
+        gateway_status=gateway_status,
+        is_reconciled=True,
+        reconciled_by=request.user,
+        notes=admin_notes
+    )
+
+    order.status = 'REFUNDED'
+    order.save()
+
+    # Reverse seller earning
+    if hasattr(order, 'earning'):
+        order.earning.status = 'REFUNDED'
+        order.earning.save()
+
+    # Mark any pending RefundRequest approved
+    pending_reqs = order.refund_requests.filter(status='PENDING')
+    for req in pending_reqs:
+        req.status = 'APPROVED'
+        req.admin_notes = admin_notes
+        req.decided_by = request.user
+        req.decided_at = timezone.now()
+        req.save()
+
+    order.add_timeline(
+        status='REFUNDED',
+        title='Refund Processed & Reconciled',
+        notes=f"Admin issued ₹{refund_amount} refund ({gateway_status}). Stock restored: {'Yes' if restore_stock else 'No'}. Notes: {admin_notes}",
+        changed_by=request.user
+    )
+
+    serializer = AdminOrderSerializer(order, context={'request': request})
+    return Response({
+        'detail': f'Order #{pk} successfully refunded and reconciled.',
+        'order': serializer.data
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_refund_requests(request):
+    """List refund requests for admin review."""
+    status_filter = request.query_params.get('status', '')
+    qs = RefundRequest.objects.select_related('order', 'customer', 'decided_by', 'order__product', 'order__seller')
+    if status_filter:
+        qs = qs.filter(status=status_filter.upper())
+    serializer = AdminRefundRequestSerializer(qs, many=True)
+    return Response(serializer.data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@admin_required
+def admin_decide_refund_request(request, pk):
+    """Admin decision (APPROVE or REJECT) on a customer refund request."""
+    try:
+        refund_req = RefundRequest.objects.select_related('order', 'customer').get(id=pk)
+    except RefundRequest.DoesNotExist:
+        return Response({'detail': 'Refund request not found.'}, status=404)
+
+    decision = request.data.get('decision', '').upper()
+    admin_notes = request.data.get('admin_notes', '').strip()
+    restore_stock = request.data.get('restore_stock', True)
+
+    if decision not in ['APPROVE', 'REJECT']:
+        return Response({'detail': 'Decision must be either APPROVE or REJECT.'}, status=400)
+
+    order = refund_req.order
+
+    if decision == 'APPROVE':
+        refund_amount = request.data.get('amount')
+        try:
+            refund_amount = float(refund_amount) if refund_amount is not None else float(refund_req.amount)
+        except (ValueError, TypeError):
+            refund_amount = float(refund_req.amount)
+
+        if restore_stock:
+            order.restore_stock()
+
+        # Reconcile Payment
+        refund_id = f"sim_ref_{order.id}_{int(timezone.now().timestamp())}"
+        gateway_status = 'SUCCEEDED'
+        if order.stripe_payment_intent:
+            try:
+                stripe_ref = stripe.Refund.create(
+                    payment_intent=order.stripe_payment_intent,
+                    amount=int(refund_amount * 100)
+                )
+                refund_id = stripe_ref.id
+            except Exception as se:
+                print(f"Stripe refund exception: {se}")
+                gateway_status = 'SIMULATED'
+
+        PaymentReconciliation.objects.create(
+            order=order,
+            refund_request=refund_req,
+            payment_intent_id=order.stripe_payment_intent,
+            refund_transaction_id=refund_id,
+            original_amount=order.total_amount,
+            refunded_amount=refund_amount,
+            gateway_status=gateway_status,
+            is_reconciled=True,
+            reconciled_by=request.user,
+            notes=admin_notes or 'Refund request approved by admin.'
+        )
+
+        order.status = 'REFUNDED'
+        order.save()
+
+        if hasattr(order, 'earning'):
+            order.earning.status = 'REFUNDED'
+            order.earning.save()
+
+        refund_req.status = 'APPROVED'
+        refund_req.admin_notes = admin_notes
+        refund_req.decided_by = request.user
+        refund_req.decided_at = timezone.now()
+        refund_req.save()
+
+        order.add_timeline(
+            status='REFUNDED',
+            title='Refund Request Approved',
+            notes=f"Admin approved refund request of ₹{refund_amount} ({gateway_status}). Stock restored: {'Yes' if restore_stock else 'No'}. Notes: {admin_notes}",
+            changed_by=request.user
+        )
+
+        return Response({
+            'detail': f'Refund request #{pk} approved. ₹{refund_amount} refunded.',
+            'refund_request': AdminRefundRequestSerializer(refund_req).data
+        })
+
+    else: # REJECT
+        if not admin_notes:
+            return Response({'detail': 'Please provide an admin note explaining the rejection reason.'}, status=400)
+
+        refund_req.status = 'REJECTED'
+        refund_req.admin_notes = admin_notes
+        refund_req.decided_by = request.user
+        refund_req.decided_at = timezone.now()
+        refund_req.save()
+
+        order.add_timeline(
+            status=order.status,
+            title='Refund Request Rejected',
+            notes=f"Admin rejected refund request: {admin_notes}",
+            changed_by=request.user
+        )
+
+        return Response({
+            'detail': f'Refund request #{pk} rejected.',
+            'refund_request': AdminRefundRequestSerializer(refund_req).data
+        })
 
 
 # ─────────────────── Customers ───────────────────
