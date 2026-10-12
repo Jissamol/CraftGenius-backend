@@ -13,13 +13,15 @@ from django.db.models import Sum, Avg, Count, Q
 from django.db.models.functions import TruncMonth, TruncDay
 from django.utils import timezone
 from datetime import timedelta
+from decimal import Decimal
 import stripe
 
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
     CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest,
-    OrderTimeline, RefundRequest, PaymentReconciliation
+    OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto,
+    SellerPayout, SellerLedgerEntry, Notification
 )
 from .recommendation_engine import (
     RecommendationEngine, record_product_view, boost_category_interest
@@ -31,11 +33,48 @@ from .serializers import (
     CartSerializer, CartItemSerializer, WishlistSerializer,
     CustomerProfileSerializer, CustomerReviewCreateSerializer,
     ProductDetailSerializer, OrderTimelineSerializer, RefundRequestSerializer,
-    PaymentReconciliationSerializer
+    PaymentReconciliationSerializer, WorkshopPhotoSerializer,
+    ArtisanStorefrontSerializer, SellerLedgerEntrySerializer,
+    SellerPayoutSerializer, NotificationSerializer
+)
+from .notifications import (
+    notify_order_placed, notify_order_status, notify_product_stock_change,
+    notify_refund, notify_seller_new_order
 )
 
 
 # ──────────────────────────── Categories ────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def my_notifications(request):
+    notifications = Notification.objects.filter(user=request.user)
+    return Response({
+        'notifications': NotificationSerializer(notifications, many=True).data,
+        'unread_count': notifications.filter(is_read=False).count(),
+    })
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def mark_all_notifications_read(request):
+    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    return Response({'detail': 'All notifications marked as read.'})
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def mark_notification_read(request, pk):
+    try:
+        notification = Notification.objects.get(pk=pk, user=request.user)
+    except Notification.DoesNotExist:
+        return Response({'detail': 'Notification not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if not notification.is_read:
+        notification.is_read = True
+        notification.save(update_fields=['is_read'])
+    return Response(NotificationSerializer(notification).data)
+
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -105,7 +144,9 @@ def update_product(request, pk):
 
     serializer = ProductCreateSerializer(product, data=request.data, partial=True, context={'request': request})
     if serializer.is_valid():
+        previous_stock = product.stock
         product = serializer.save()
+        notify_product_stock_change(product, previous_stock)
 
         # Handle new image uploads
         images = request.FILES.getlist('images')
@@ -220,6 +261,8 @@ def update_order_status(request, pk):
             notes=timeline_notes,
             changed_by=request.user
         )
+        if old_status != new_status:
+            notify_order_status(order)
 
         result = OrderSerializer(order, context={'request': request})
         return Response(result.data)
@@ -291,33 +334,268 @@ def seller_profile(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def add_workshop_photo(request):
+    profile, _ = SellerProfile.objects.get_or_create(user=request.user)
+    image = request.FILES.get('image')
+    if not image:
+        return Response({'detail': 'Image is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    caption = request.data.get('caption', '')
+    photo = WorkshopPhoto.objects.create(seller_profile=profile, image=image, caption=caption)
+    serializer = WorkshopPhotoSerializer(photo, context={'request': request})
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_workshop_photo(request, pk):
+    try:
+        photo = WorkshopPhoto.objects.get(pk=pk, seller_profile__user=request.user)
+        photo.delete()
+        return Response({'detail': 'Workshop photo removed.'})
+    except WorkshopPhoto.DoesNotExist:
+        return Response({'detail': 'Photo not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def artisan_storefront(request, pk):
+    """Public Storefront API for an artisan with bio, craft story, workshop photos, products, and reviews."""
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        artisan_user = User.objects.get(id=pk, role='HANDICRAFTER')
+    except User.DoesNotExist:
+        return Response({'detail': 'Artisan not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    profile, _ = SellerProfile.objects.get_or_create(user=artisan_user)
+    profile_data = ArtisanStorefrontSerializer(profile, context={'request': request}).data
+
+    # Products by this artisan
+    products_qs = Product.objects.filter(seller=artisan_user, is_active=True, is_approved=True).select_related('category')
+    
+    cat_param = request.query_params.get('category')
+    if cat_param:
+        products_qs = products_qs.filter(category_id=cat_param)
+
+    sort = request.query_params.get('sort', 'newest')
+    if sort == 'price_low':
+        products_qs = products_qs.order_by('price')
+    elif sort == 'price_high':
+        products_qs = products_qs.order_by('-price')
+    else:
+        products_qs = products_qs.order_by('-created_at')
+
+    products_data = ProductSerializer(products_qs, many=True, context={'request': request}).data
+
+    # Reviews received across all this artisan's products
+    reviews_qs = Review.objects.filter(product__seller=artisan_user).select_related('customer', 'product').order_by('-created_at')[:30]
+    reviews_data = ReviewSerializer(reviews_qs, many=True, context={'request': request}).data
+
+    # Distinct categories
+    categories = Category.objects.filter(products__seller=artisan_user, products__is_active=True, products__is_approved=True).distinct()
+    categories_data = CategorySerializer(categories, many=True, context={'request': request}).data
+
+    return Response({
+        'artisan': profile_data,
+        'products': products_data,
+        'reviews': reviews_data,
+        'categories': categories_data
+    })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def artisan_list(request):
+    """List of all public verified artisans."""
+    artisans = SellerProfile.objects.filter(
+        user__role='HANDICRAFTER',
+        user__is_approved=True
+    ).select_related('user').prefetch_related('workshop_photos')
+
+    search = request.query_params.get('search', '').strip()
+    if search:
+        artisans = artisans.filter(
+            Q(user__name__icontains=search) |
+            Q(craft_specialty__icontains=search) |
+            Q(location__icontains=search) |
+            Q(bio__icontains=search)
+        )
+
+    serializer = ArtisanStorefrontSerializer(artisans, many=True, context={'request': request})
+    return Response(serializer.data)
+
+
 # ──────────────────────────── Earnings ──────────────────────────────
+
+def ensure_ledger_backfill(seller):
+    """
+    Guarantees that existing paid orders for a seller are recorded in the
+    SellerLedgerEntry transaction ledger if no entries exist yet.
+    """
+    if not SellerLedgerEntry.objects.filter(seller=seller).exists():
+        paid_orders = Order.objects.filter(seller=seller, is_paid=True).order_by('created_at', 'id')
+        for ord_obj in paid_orders:
+            comm_rate = CommissionSetting.get_rate()
+            comm = (ord_obj.total_amount * comm_rate) / Decimal('100.00')
+            # Record Gross Sale
+            SellerLedgerEntry.record(
+                seller=seller,
+                entry_type='SALE',
+                amount=ord_obj.total_amount,
+                is_credit=True,
+                description=f"Gross Sale for Order #{ord_obj.id} ({ord_obj.product.name})",
+                order=ord_obj,
+                reference_id=ord_obj.stripe_payment_intent or ''
+            )
+            # Record Platform Commission
+            SellerLedgerEntry.record(
+                seller=seller,
+                entry_type='COMMISSION',
+                amount=comm,
+                is_credit=False,
+                description=f"Platform Commission ({comm_rate}%) for Order #{ord_obj.id}",
+                order=ord_obj,
+                reference_id=ord_obj.stripe_payment_intent or ''
+            )
+            # If refunded, record refund deduction
+            if ord_obj.status == 'REFUNDED':
+                net_deduction = ord_obj.total_amount - comm
+                SellerLedgerEntry.record(
+                    seller=seller,
+                    entry_type='REFUND',
+                    amount=net_deduction,
+                    is_credit=False,
+                    description=f"Customer Refund deduction for Order #{ord_obj.id}",
+                    order=ord_obj,
+                    reference_id=f"ref_{ord_obj.id}"
+                )
+
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def seller_earnings(request):
-    earnings = Earning.objects.filter(seller=request.user)
+    """
+    Provides transparent seller financials and ledger records:
+    - Gross Sales (sum of paid order totals)
+    - Platform Commission (sum of commissions deducted)
+    - Refunds (sum of customer refunds deducted)
+    - Net Earnings (Gross - Commission - Refunds)
+    - Available Withdrawable Balance (Current ledger balance minus pending payouts)
+    - Total Paid Out (Sum of completed payouts)
+    - Pending Payouts (Sum of pending review or processing payouts)
+    - Payout Status Breakdown
+    - Immutable Transaction Ledger Entries
+    - Payout Requests History
+    """
+    seller = request.user
+    ensure_ledger_backfill(seller)
 
-    active_earnings = earnings.exclude(status__in=['CANCELLED', 'REFUNDED'])
-    total = active_earnings.aggregate(
-        total_amount=Sum('amount'),
-        total_commission=Sum('commission'),
-        total_net=Sum('net_amount')
-    )
+    # Calculate financial aggregates from ledger entries
+    ledger_qs = SellerLedgerEntry.objects.filter(seller=seller)
 
-    withdrawable = active_earnings.filter(status='PENDING').aggregate(
-        amount=Sum('net_amount')
-    )['amount'] or 0
+    gross_sales = ledger_qs.filter(entry_type='SALE').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    total_commission = ledger_qs.filter(entry_type='COMMISSION').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    total_refunds = ledger_qs.filter(entry_type='REFUND').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    net_earnings = gross_sales - total_commission - total_refunds
 
-    serializer = EarningSerializer(earnings, many=True, context={'request': request})
+    # Payouts
+    payouts_qs = SellerPayout.objects.filter(seller=seller)
+    total_paid_out = payouts_qs.filter(status='PAID').aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    pending_payouts = payouts_qs.filter(status__in=['PENDING', 'PROCESSING']).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+
+    # Available balance = ledger running balance minus reserved pending payouts
+    ledger_balance = SellerLedgerEntry.get_seller_balance(seller)
+    available_balance = max(Decimal('0.00'), ledger_balance - pending_payouts)
+
+    # Payout status breakdown
+    status_choices = ['PENDING', 'PROCESSING', 'PAID', 'REJECTED']
+    payout_breakdown = {}
+    for st in status_choices:
+        filtered = payouts_qs.filter(status=st)
+        payout_breakdown[st] = {
+            'count': filtered.count(),
+            'amount': float(filtered.aggregate(s=Sum('amount'))['s'] or 0)
+        }
+
+    # Serialization
+    ledger_serializer = SellerLedgerEntrySerializer(ledger_qs[:100], many=True)
+    payout_serializer = SellerPayoutSerializer(payouts_qs[:50], many=True)
+    
+    # Legacy earnings for backward compatibility
+    legacy_earnings = Earning.objects.filter(seller=seller)
+    legacy_serializer = EarningSerializer(legacy_earnings, many=True, context={'request': request})
 
     return Response({
-        'total_earnings': total['total_amount'] or 0,
-        'total_commission': total['total_commission'] or 0,
-        'total_net': total['total_net'] or 0,
-        'withdrawable': withdrawable,
-        'history': serializer.data
+        'gross_sales': float(gross_sales),
+        'total_commission': float(total_commission),
+        'total_refunds': float(total_refunds),
+        'net_earnings': float(net_earnings),
+        'available_balance': float(available_balance),
+        'total_paid_out': float(total_paid_out),
+        'pending_payouts': float(pending_payouts),
+        'payout_status_breakdown': payout_breakdown,
+        'ledger_entries': ledger_serializer.data,
+        'payouts': payout_serializer.data,
+        
+        # Backward compatibility aliases
+        'total_earnings': float(gross_sales),
+        'total_net': float(net_earnings),
+        'withdrawable': float(available_balance),
+        'history': legacy_serializer.data
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def request_payout(request):
+    """
+    Artisan requests a payout withdrawal against their available balance.
+    """
+    seller = request.user
+    ensure_ledger_backfill(seller)
+
+    try:
+        amount = Decimal(str(request.data.get('amount', 0)))
+    except Exception:
+        return Response({'detail': 'Please provide a valid payout amount.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if amount <= Decimal('0.00'):
+        return Response({'detail': 'Payout amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payouts_qs = SellerPayout.objects.filter(seller=seller)
+    pending_payouts = payouts_qs.filter(status__in=['PENDING', 'PROCESSING']).aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
+    ledger_balance = SellerLedgerEntry.get_seller_balance(seller)
+    available_balance = max(Decimal('0.00'), ledger_balance - pending_payouts)
+
+    if amount > available_balance:
+        return Response({
+            'detail': f'Requested amount (₹{amount}) exceeds your available balance (₹{available_balance:.2f}).'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    payout_method = request.data.get('payout_method', 'BANK_TRANSFER')
+    account_details = request.data.get('account_details', '').strip()
+    notes = request.data.get('notes', '').strip()
+
+    if not account_details:
+        return Response({'detail': 'Account details (e.g. Bank Account / IFSC or UPI ID) are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    payout = SellerPayout.objects.create(
+        seller=seller,
+        amount=amount,
+        status='PENDING',
+        payout_method=payout_method,
+        account_details=account_details,
+        notes=notes
+    )
+
+    return Response({
+        'detail': f'Payout request of ₹{amount} submitted successfully! Processing time: 1-3 business days.',
+        'payout': SellerPayoutSerializer(payout).data
+    }, status=status.HTTP_201_CREATED)
+
 
 
 # ──────────────────────────── Analytics ─────────────────────────────
@@ -664,8 +942,12 @@ def create_order(request):
             total_amount=item.line_total
         )
         # Reduce stock
+        previous_stock = item.product.stock
         item.product.stock -= item.quantity
         item.product.save()
+        notify_product_stock_change(item.product, previous_stock)
+        notify_order_placed(order)
+        notify_seller_new_order(order)
 
         # Add initial timeline
         order.add_timeline(
@@ -747,6 +1029,21 @@ def cancel_order(request, pk):
         if hasattr(order, 'earning'):
             order.earning.status = 'CANCELLED'
             order.earning.save()
+
+        # Record refund deduction in transaction ledger
+        comm_rate = CommissionSetting.get_rate()
+        comm = (order.total_amount * comm_rate) / Decimal('100.00')
+        net_refund_deduction = order.total_amount - comm
+        if not SellerLedgerEntry.objects.filter(order=order, entry_type='REFUND').exists():
+            SellerLedgerEntry.record(
+                seller=order.seller,
+                entry_type='REFUND',
+                amount=net_refund_deduction,
+                is_credit=False,
+                description=f"Customer Refund deduction for cancelled Order #{order.id}",
+                order=order,
+                reference_id=refund_id
+            )
     else:
         order.status = 'CANCELLED'
 
@@ -760,6 +1057,15 @@ def cancel_order(request, pk):
         notes=f"Reason: {reason}. Product stock restored.",
         changed_by=request.user
     )
+    if order.status == 'REFUNDED':
+        notify_refund(
+            order.customer,
+            order,
+            "Your cancelled order has been refunded.",
+            title="Refund processed",
+        )
+    else:
+        notify_order_status(order)
 
     serializer = OrderSerializer(order, context={'request': request})
     return Response(serializer.data)
@@ -821,6 +1127,12 @@ def request_refund(request, pk):
         title='Refund & Return Requested',
         notes=f"Reason: {refund_req.get_reason_display()}. Amount: ₹{amount}. Explanation: {explanation}",
         changed_by=request.user
+    )
+    notify_refund(
+        request.user,
+        order,
+        "Your refund request has been received and is awaiting review.",
+        title="Refund request received",
     )
 
     serializer = OrderSerializer(order, context={'request': request})
@@ -1204,5 +1516,3 @@ def chat_assistant(request):
 
     except Exception as e:
         return Response({'detail': f'Error generating response: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-

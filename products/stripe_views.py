@@ -5,8 +5,11 @@ from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from .models import Product, Order, CommissionSetting, Earning
+from .models import Product, Order, CommissionSetting, Earning, SellerLedgerEntry, PlatformMonitoringLog
 from .recommendation_engine import boost_category_interest
+from .notifications import (
+    notify_order_placed, notify_payment_confirmed, notify_product_stock_change
+)
 from decimal import Decimal
 import os
 
@@ -94,6 +97,7 @@ def create_checkout_session(request):
                 notes='Checkout session initiated. Awaiting payment.',
                 changed_by=request.user
             )
+            notify_order_placed(order)
             if product.category:
                 boost_category_interest(request.user, product.category, points=4.0)
         else:
@@ -117,6 +121,7 @@ def create_checkout_session(request):
                     notes='Checkout session initiated for cart item. Awaiting payment.',
                     changed_by=request.user
                 )
+                notify_order_placed(order)
                 if item.product.category:
                     boost_category_interest(request.user, item.product.category, points=4.0)
             # We DON'T clear the cart yet. We clear it in the webhook or on success page confirmation.
@@ -146,9 +151,21 @@ def stripe_webhook(request):
         )
     except ValueError as e:
         # Invalid payload
+        PlatformMonitoringLog.record(
+            log_type='WEBHOOK_ERROR',
+            severity='WARNING',
+            source='Stripe Webhook',
+            error_message=f'Invalid webhook payload: {str(e)}'
+        )
         return HttpResponse(status=400)
     except stripe.error.SignatureVerificationError as e:
         # Invalid signature
+        PlatformMonitoringLog.record(
+            log_type='WEBHOOK_ERROR',
+            severity='CRITICAL',
+            source='Stripe Webhook',
+            error_message=f'Signature verification failed: {str(e)}'
+        )
         return HttpResponse(status=400)
 
     # Handle the checkout.session.completed event
@@ -164,6 +181,9 @@ def stripe_webhook(request):
             orders = Order.objects.filter(stripe_session_id=session_id)
             
             for order in orders:
+                if order.is_paid:
+                    continue
+
                 order.is_paid = True
                 order.status = 'PROCESSING'
                 order.stripe_payment_intent = payment_intent
@@ -191,11 +211,35 @@ def stripe_webhook(request):
                         'status': 'PENDING'
                     }
                 )
+
+                # Record in Seller Financial Transaction Ledger
+                if not SellerLedgerEntry.objects.filter(order=order, entry_type='SALE').exists():
+                    SellerLedgerEntry.record(
+                        seller=order.seller,
+                        entry_type='SALE',
+                        amount=order.total_amount,
+                        is_credit=True,
+                        description=f"Gross Sale for Order #{order.id} ({order.product.name})",
+                        order=order,
+                        reference_id=payment_intent or order.stripe_payment_intent or ''
+                    )
+                    SellerLedgerEntry.record(
+                        seller=order.seller,
+                        entry_type='COMMISSION',
+                        amount=commission,
+                        is_credit=False,
+                        description=f"Platform Commission ({commission_rate}%) for Order #{order.id}",
+                        order=order,
+                        reference_id=payment_intent or order.stripe_payment_intent or ''
+                    )
                 
                 # Reduce stock
                 product = order.product
+                previous_stock = product.stock
                 product.stock -= order.quantity
                 product.save()
+                notify_product_stock_change(product, previous_stock)
+                notify_payment_confirmed(order)
 
             # If it was a cart checkout, clear the cart
             if getattr(metadata, 'type', None) == 'cart':
@@ -204,6 +248,14 @@ def stripe_webhook(request):
                 
         except Exception as e:
             print(f"Error processing webhook for session {session_id}: {e}")
+            PlatformMonitoringLog.record(
+                log_type='WEBHOOK_ERROR',
+                severity='ERROR',
+                source='Stripe Webhook',
+                error_message=f'Webhook execution failed for session {session_id}: {str(e)}',
+                event_id=session_id or '',
+                payload={'session_id': session_id, 'payment_intent': payment_intent, 'user_id': user_id}
+            )
 
     elif event['type'] in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
         session = event['data']['object']
@@ -211,6 +263,18 @@ def stripe_webhook(request):
         
         try:
             orders = Order.objects.filter(stripe_session_id=session_id, is_paid=False)
+            cust_email = orders.first().customer.email if orders.exists() else ''
+            
+            PlatformMonitoringLog.record(
+                log_type='PAYMENT_FAILURE',
+                severity='WARNING',
+                source='Stripe Webhook',
+                error_message=f"Checkout session {session_id} ended with {event['type']}.",
+                event_id=session_id or '',
+                customer_email=cust_email,
+                payload={'event_type': event['type']}
+            )
+
             for order in orders:
                 order.status = 'FAILED'
                 order.save()
@@ -222,6 +286,13 @@ def stripe_webhook(request):
                 )
         except Exception as e:
             print(f"Error processing failed webhook for session {session_id}: {e}")
+            PlatformMonitoringLog.record(
+                log_type='WEBHOOK_ERROR',
+                severity='ERROR',
+                source='Stripe Webhook',
+                error_message=f'Error processing failed webhook session {session_id}: {str(e)}',
+                event_id=session_id or ''
+            )
 
     return HttpResponse(status=200)
 
@@ -252,6 +323,7 @@ def payment_success_view(request):
                         notes=f'Payment verified via Stripe Checkout session {session_id[:16]}... Order is now processing.',
                         changed_by=request.user
                     )
+                    notify_payment_confirmed(order)
                     
                     # Calculate and create Earning
                     commission_rate = CommissionSetting.get_rate()
@@ -268,11 +340,34 @@ def payment_success_view(request):
                             'status': 'PENDING'
                         }
                     )
+
+                    # Record in Seller Financial Transaction Ledger
+                    if not SellerLedgerEntry.objects.filter(order=order, entry_type='SALE').exists():
+                        SellerLedgerEntry.record(
+                            seller=order.seller,
+                            entry_type='SALE',
+                            amount=order.total_amount,
+                            is_credit=True,
+                            description=f"Gross Sale for Order #{order.id} ({order.product.name})",
+                            order=order,
+                            reference_id=order.stripe_payment_intent or session_id
+                        )
+                        SellerLedgerEntry.record(
+                            seller=order.seller,
+                            entry_type='COMMISSION',
+                            amount=commission,
+                            is_credit=False,
+                            description=f"Platform Commission ({commission_rate}%) for Order #{order.id}",
+                            order=order,
+                            reference_id=order.stripe_payment_intent or session_id
+                        )
                     
                     # Stock reduction (atomicity check)
                     product = order.product
+                    previous_stock = product.stock
                     product.stock -= order.quantity
                     product.save()
+                    notify_product_stock_change(product, previous_stock)
                 
                 # Clear cart if it was a cart checkout
                 if getattr(session.metadata, 'type', None) == 'cart':
@@ -280,6 +375,13 @@ def payment_success_view(request):
                     Cart.objects.get(user=request.user).items.all().delete()
         except Exception as e:
             print(f"Fallback check failed: {e}")
+            PlatformMonitoringLog.record(
+                log_type='GATEWAY_ANOMALY',
+                severity='WARNING',
+                source='Payment Verification',
+                error_message=f'Fallback payment check exception for session {session_id}: {str(e)}',
+                event_id=session_id or ''
+            )
 
     orders = Order.objects.filter(stripe_session_id=session_id, customer=request.user)
     if not orders.filter(is_paid=True).exists():

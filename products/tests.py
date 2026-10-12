@@ -1,15 +1,23 @@
 from django.test import TestCase
+from rest_framework.test import APIClient
 from django.contrib.auth import get_user_model
+from django.core import mail
+from django.test import override_settings
 from decimal import Decimal
 from products.models import (
     Category, Product, Order, OrderTimeline,
-    RefundRequest, PaymentReconciliation, Earning
+    RefundRequest, PaymentReconciliation, Earning,
+    SellerPayout, SellerLedgerEntry,
+    AdminAuditLog, PlatformMonitoringLog, CommissionSetting,
+    Notification, Wishlist, Cart, CartItem
 )
+from products.notifications import notify_product_stock_change, notify_user
 
 User = get_user_model()
 
 class OrderManagementTests(TestCase):
     def setUp(self):
+        self.client = APIClient()
         self.customer = User.objects.create_user(
             email='customer@example.com',
             password='password123',
@@ -188,3 +196,363 @@ class OrderManagementTests(TestCase):
         self.assertEqual(earning.status, 'REFUNDED')
         self.assertEqual(recon.gateway_status, 'SUCCEEDED')
         self.assertTrue(recon.is_reconciled)
+
+    def test_artisan_storefront(self):
+        """Test public artisan storefront data and craft stories."""
+        from products.models import SellerProfile, WorkshopPhoto
+        profile, _ = SellerProfile.objects.get_or_create(
+            user=self.seller,
+            defaults={
+                'bio': 'Passionate heritage woodworker from Kerala.',
+                'craft_story': 'Learned the art of woodcarving from three generations of master crafters.',
+                'craft_specialty': 'Teakwood & Rosewood Carving',
+                'workshop_headline': 'Heritage Wood Studio, Calicut',
+                'years_of_experience': 14,
+                'techniques_used': 'Hand-chiseling, Natural Wax Polishing',
+                'materials_used': 'Sustainable Teakwood, Natural Beeswax'
+            }
+        )
+
+        response = self.client.get(f'/api/artisan/{self.seller.id}/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data['artisan']['name'], 'Test Seller')
+        self.assertTrue(data['artisan']['is_verified'])
+        self.assertEqual(len(data['products']), 1)
+        self.assertEqual(data['products'][0]['name'], 'Handmade Bowl')
+
+    def test_transaction_ledger_and_transparent_earnings(self):
+        """Test transaction ledger tracking, running balance, and transparent earnings breakdown."""
+        order = Order.objects.create(
+            customer=self.customer,
+            product=self.product,
+            seller=self.seller,
+            quantity=2,
+            total_amount=Decimal('1000.00'),
+            status='PROCESSING',
+            is_paid=True,
+            stripe_payment_intent='pi_ledger_test_100'
+        )
+
+        # Record Gross Sale in ledger
+        entry_sale = SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='SALE',
+            amount=Decimal('1000.00'),
+            is_credit=True,
+            description="Gross Sale for Order #1",
+            order=order,
+            reference_id='pi_ledger_test_100'
+        )
+        self.assertEqual(entry_sale.balance_after, Decimal('1000.00'))
+
+        # Record Platform Commission (10%)
+        entry_comm = SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='COMMISSION',
+            amount=Decimal('100.00'),
+            is_credit=False,
+            description="Platform Commission (10%) for Order #1",
+            order=order,
+            reference_id='pi_ledger_test_100'
+        )
+        self.assertEqual(entry_comm.balance_after, Decimal('900.00'))
+
+        # Authenticate seller and check GET /api/seller/earnings/
+        self.client.force_authenticate(user=self.seller)
+        response = self.client.get('/api/seller/earnings/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+
+        self.assertEqual(data['gross_sales'], 1000.0)
+        self.assertEqual(data['total_commission'], 100.0)
+        self.assertEqual(data['total_refunds'], 0.0)
+        self.assertEqual(data['net_earnings'], 900.0)
+        self.assertEqual(data['available_balance'], 900.0)
+        self.assertEqual(len(data['ledger_entries']), 2)
+
+    def test_payout_request_and_admin_processing(self):
+        """Test seller payout request, balance reservation, and admin payout processing."""
+        # Seed ledger with 1500 net balance
+        SellerLedgerEntry.record(
+            seller=self.seller,
+            entry_type='SALE',
+            amount=Decimal('1500.00'),
+            is_credit=True,
+            description="Sale initial balance"
+        )
+
+        self.client.force_authenticate(user=self.seller)
+        
+        # 1. Attempt to withdraw more than available balance (should fail)
+        res_fail = self.client.post('/api/seller/payouts/request/', {
+            'amount': '2000.00',
+            'payout_method': 'BANK_TRANSFER',
+            'account_details': 'HDFC0001, A/C: 123456'
+        })
+        self.assertEqual(res_fail.status_code, 400)
+
+        # 2. Withdraw valid amount
+        res_req = self.client.post('/api/seller/payouts/request/', {
+            'amount': '500.00',
+            'payout_method': 'BANK_TRANSFER',
+            'account_details': 'HDFC0001, A/C: 123456',
+            'notes': 'Monthly payout'
+        })
+        self.assertEqual(res_req.status_code, 201)
+        payout_id = res_req.json()['payout']['id']
+
+        # Available balance should now be 1500 - 500 = 1000
+        res_earn = self.client.get('/api/seller/earnings/')
+        self.assertEqual(res_earn.json()['available_balance'], 1000.0)
+        self.assertEqual(res_earn.json()['pending_payouts'], 500.0)
+
+        # 3. Admin approves payout
+        self.client.force_authenticate(user=self.admin)
+        res_approve = self.client.post(f'/api/admin/payouts/{payout_id}/process/', {
+            'action': 'APPROVE',
+            'reference_id': 'UTR_TEST_12345678'
+        })
+        self.assertEqual(res_approve.status_code, 200)
+        self.assertEqual(res_approve.json()['payout']['status'], 'PAID')
+
+        # Verify payout ledger entry was recorded and balance updated
+        payout_entry = SellerLedgerEntry.objects.filter(payout_id=payout_id, entry_type='PAYOUT').first()
+        self.assertIsNotNone(payout_entry)
+        self.assertEqual(payout_entry.amount, Decimal('500.00'))
+        self.assertFalse(payout_entry.is_credit)
+        self.assertEqual(payout_entry.balance_after, Decimal('1000.00'))
+
+
+class AdminAuditAndMonitoringTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            email='superadmin@example.com',
+            password='password123',
+            name='Master Admin',
+            role='ADMIN',
+            is_superuser=True
+        )
+        self.seller = User.objects.create_user(
+            email='artisan_cand@example.com',
+            password='password123',
+            name='Candidate Artisan',
+            role='HANDICRAFTER',
+            is_approved=False
+        )
+        self.category = Category.objects.create(name='Clay & Ceramics', slug='clay-ceramics')
+        self.product = Product.objects.create(
+            name='Handmade Pot',
+            seller=self.seller,
+            category=self.category,
+            price=Decimal('250.00'),
+            stock=5,
+            is_approved=False
+        )
+        self.client.force_authenticate(user=self.admin)
+
+    def test_seller_approval_audit_log(self):
+        """Admin approving handicrafter writes to AdminAuditLog."""
+        res = self.client.put(f'/api/admin/handicrafters/{self.seller.id}/approve/')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(
+            action_type='SELLER_APPROVAL',
+            target_id=str(self.seller.id)
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.admin, self.admin)
+        self.assertEqual(log.details.get('decision'), 'APPROVED')
+
+    def test_product_moderation_audit_log(self):
+        """Admin approving product writes to AdminAuditLog."""
+        res = self.client.put(f'/api/admin/products/{self.product.id}/approve/')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(
+            action_type='PRODUCT_MODERATION',
+            target_id=str(self.product.id)
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.details.get('decision'), 'APPROVED')
+
+    def test_commission_change_audit_log(self):
+        """Admin changing commission rate records before and after values in audit log."""
+        CommissionSetting.objects.update_or_create(id=1, defaults={'percentage': Decimal('10.00')})
+
+        res = self.client.put('/api/admin/commission/', {'percentage': 12.50}, format='json')
+        self.assertEqual(res.status_code, 200)
+
+        log = AdminAuditLog.objects.filter(action_type='COMMISSION_CHANGE').first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.details.get('new_rate'), 12.50)
+        self.assertEqual(log.details.get('previous_rate'), 10.00)
+
+    def test_platform_monitoring_incident_and_resolve(self):
+        """Platform error log creation and administrative resolution."""
+        incident = PlatformMonitoringLog.record(
+            log_type='PAYMENT_FAILURE',
+            severity='WARNING',
+            source='STRIPE_CHECKOUT',
+            event_id='evt_test_failed_123',
+            customer_email='buyer@example.com',
+            error_message='Payment method card_declined by issuer.',
+            payload={'decline_code': 'insufficient_funds'}
+        )
+        self.assertFalse(incident.is_resolved)
+
+        # Query monitoring summary & logs
+        res = self.client.get('/api/admin/monitoring/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()['health_summary']['total_events'], 1)
+        self.assertEqual(res.json()['health_summary']['unresolved_count'], 1)
+
+        # Resolve incident
+        resolve_res = self.client.post(
+            f'/api/admin/monitoring/{incident.id}/resolve/',
+            {'notes': 'Customer re-attempted with alternate card successfully.'},
+            format='json'
+        )
+        self.assertEqual(resolve_res.status_code, 200)
+        incident.refresh_from_db()
+        self.assertTrue(incident.is_resolved)
+        self.assertEqual(incident.resolved_by, self.admin)
+
+        # Check that resolution was also recorded into the admin audit log
+        res_audit = self.client.get('/api/admin/audit-logs/')
+        self.assertEqual(res_audit.status_code, 200)
+        logs = res_audit.json()['logs']
+        self.assertTrue(any('Resolved monitoring incident' in r['action_summary'] for r in logs))
+
+
+class NotificationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email='notify-customer@example.com',
+            password='password123',
+            name='Notification Customer',
+            role='CUSTOMER'
+        )
+        self.seller = User.objects.create_user(
+            email='notify-seller@example.com',
+            password='password123',
+            name='Notification Seller',
+            role='HANDICRAFTER',
+            is_approved=True
+        )
+        self.admin = User.objects.create_user(
+            email='notify-admin@example.com',
+            password='password123',
+            name='Notification Admin',
+            role='ADMIN',
+            is_superuser=True
+        )
+        self.product = Product.objects.create(
+            name='Notification Product',
+            seller=self.seller,
+            price=Decimal('25.00'),
+            stock=0
+        )
+
+    def test_notifications_are_user_scoped_and_can_be_marked_read(self):
+        customer_notification = notify_user(
+            self.customer, 'ORDER', 'Order update', 'Your order changed.'
+        )
+        seller_notification = notify_user(
+            self.seller, 'LOW_STOCK', 'Low stock', 'Only 2 units remain.'
+        )
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get('/api/notifications/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['unread_count'], 1)
+        self.assertEqual(
+            [item['id'] for item in response.json()['notifications']],
+            [customer_notification.id]
+        )
+
+        response = self.client.patch(
+            f'/api/notifications/{customer_notification.id}/read/'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['is_read'])
+
+        response = self.client.patch(
+            f'/api/notifications/{seller_notification.id}/read/'
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_restock_and_low_stock_transitions_notify_right_people(self):
+        Wishlist.objects.create(user=self.customer, product=self.product)
+
+        self.product.stock = 3
+        notify_product_stock_change(self.product, previous_stock=0)
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer, notification_type='RESTOCK'
+        ).exists())
+        self.assertEqual(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).count(), 1)
+
+        self.product.stock = 5
+        notify_product_stock_change(self.product, previous_stock=8)
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).exists())
+
+        self.product.stock = 4
+        notify_product_stock_change(self.product, previous_stock=5)
+        self.assertEqual(
+            Notification.objects.filter(
+                user=self.seller, notification_type='LOW_STOCK'
+            ).count(),
+            2
+        )
+
+    def test_new_order_and_product_approval_events_are_wired(self):
+        self.product.stock = 6
+        self.product.save()
+        cart, _ = Cart.objects.get_or_create(user=self.customer)
+        CartItem.objects.create(cart=cart, product=self.product, quantity=2)
+
+        self.client.force_authenticate(self.customer)
+        response = self.client.post('/api/orders/create/', {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer, notification_type='ORDER'
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='NEW_ORDER'
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).exists())
+
+        self.product.is_approved = False
+        self.product.save()
+        self.client.force_authenticate(self.admin)
+        response = self.client.put(
+            f'/api/admin/products/{self.product.id}/approve/',
+            {},
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='PRODUCT_APPROVAL'
+        ).exists())
+
+    @override_settings(
+        EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+        DEFAULT_FROM_EMAIL='notifications@example.com'
+    )
+    def test_notification_email_is_sent_after_commit(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_user(
+                self.customer, 'ORDER', 'Order confirmed', 'Your order is confirmed.'
+            )
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.customer.email])
+        self.assertIn('Your order is confirmed.', mail.outbox[0].body)

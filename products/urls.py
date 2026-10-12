@@ -2,6 +2,11 @@ from django.urls import path
 from . import views, admin_views, stripe_views
 
 urlpatterns = [
+    # Notifications
+    path('notifications/', views.my_notifications, name='my-notifications'),
+    path('notifications/read-all/', views.mark_all_notifications_read, name='mark-all-notifications-read'),
+    path('notifications/<int:pk>/read/', views.mark_notification_read, name='mark-notification-read'),
+
     # ──────────── Stripe Endpoints ────────────
     path('stripe/create-session/', stripe_views.create_checkout_session, name='stripe-create-session'),
     path('stripe/webhook/', stripe_views.stripe_webhook, name='stripe-webhook'),
@@ -25,11 +30,18 @@ urlpatterns = [
     path('reviews/seller/', views.seller_reviews, name='seller-reviews'),
     path('reviews/<int:pk>/reply/', views.reply_to_review, name='reply-to-review'),
 
-    # Seller Profile
+    # Seller Profile & Workshop Photos
     path('seller/profile/', views.seller_profile, name='seller-profile'),
+    path('seller/workshop-photos/', views.add_workshop_photo, name='add-workshop-photo'),
+    path('seller/workshop-photos/<int:pk>/', views.delete_workshop_photo, name='delete-workshop-photo'),
 
-    # Earnings
+    # Public Artisan Storefronts
+    path('artisan/<int:pk>/', views.artisan_storefront, name='artisan-storefront'),
+    path('artisans/', views.artisan_list, name='artisan-list'),
+
+    # Earnings & Payouts
     path('seller/earnings/', views.seller_earnings, name='seller-earnings'),
+    path('seller/payouts/request/', views.request_payout, name='seller-request-payout'),
 
     # Analytics
     path('seller/analytics/', views.seller_analytics, name='seller-analytics'),
@@ -118,4 +130,13 @@ urlpatterns = [
 
     # Commission
     path('admin/commission/', admin_views.admin_commission, name='admin-commission'),
+
+    # Payouts
+    path('admin/payouts/', admin_views.admin_payout_list, name='admin-payout-list'),
+    path('admin/payouts/<int:pk>/process/', admin_views.admin_process_payout, name='admin-process-payout'),
+
+    # Audit Logs & Platform Monitoring
+    path('admin/audit-logs/', admin_views.admin_audit_logs, name='admin-audit-logs'),
+    path('admin/monitoring/', admin_views.admin_monitoring_logs, name='admin-monitoring-logs'),
+    path('admin/monitoring/<int:pk>/resolve/', admin_views.admin_resolve_monitoring_log, name='admin-resolve-monitoring-log'),
 ]

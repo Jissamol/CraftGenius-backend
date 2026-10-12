@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
@@ -179,8 +180,11 @@ class Order(models.Model):
     def restore_stock(self):
         """Idempotently restore stock for the ordered product."""
         if not self.stock_restored:
+            previous_stock = self.product.stock
             self.product.stock += self.quantity
             self.product.save(update_fields=['stock'])
+            from .notifications import notify_product_stock_change
+            notify_product_stock_change(self.product, previous_stock)
             self.stock_restored = True
             self.save(update_fields=['stock_restored'])
             return True
@@ -347,8 +351,15 @@ class SellerProfile(models.Model):
         related_name='seller_profile'
     )
     bio = models.TextField(blank=True, default='')
+    craft_story = models.TextField(blank=True, default='')
     profile_picture = models.ImageField(upload_to='profiles/', blank=True, null=True)
+    cover_banner = models.ImageField(upload_to='banners/', blank=True, null=True)
     craft_specialty = models.CharField(max_length=200, blank=True, default='')
+    workshop_headline = models.CharField(max_length=200, blank=True, default='')
+    years_of_experience = models.PositiveIntegerField(default=1)
+    techniques_used = models.CharField(max_length=300, blank=True, default='')
+    materials_used = models.CharField(max_length=300, blank=True, default='')
+    badge_label = models.CharField(max_length=100, blank=True, default='Master Artisan')
     location = models.CharField(max_length=200, blank=True, default='')
     social_links = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -356,6 +367,23 @@ class SellerProfile(models.Model):
 
     def __str__(self):
         return f"Profile of {self.user.name}"
+
+
+class WorkshopPhoto(models.Model):
+    seller_profile = models.ForeignKey(
+        SellerProfile,
+        on_delete=models.CASCADE,
+        related_name='workshop_photos'
+    )
+    image = models.ImageField(upload_to='workshops/')
+    caption = models.CharField(max_length=255, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"Workshop photo for {self.seller_profile.user.name}"
 
 
 class Earning(models.Model):
@@ -456,6 +484,35 @@ class Wishlist(models.Model):
 
     def __str__(self):
         return f"{self.user.name} ♥ {self.product.name}"
+
+
+class Notification(models.Model):
+    TYPE_CHOICES = (
+        ('ORDER', 'Order'),
+        ('REFUND', 'Refund'),
+        ('RESTOCK', 'Restock'),
+        ('NEW_ORDER', 'New Order'),
+        ('LOW_STOCK', 'Low Stock'),
+        ('PRODUCT_APPROVAL', 'Product Approval'),
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notifications'
+    )
+    notification_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=150)
+    message = models.TextField()
+    url = models.CharField(max_length=255, blank=True, default='')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.title} for {self.user.email}"
 
 
 class CustomerProfile(models.Model):
@@ -600,3 +657,214 @@ class UserCategoryInterest(models.Model):
     def __str__(self):
         return f"{self.user.name} interest in {self.category.name}: {self.score}"
 
+
+class SellerPayout(models.Model):
+    STATUS_CHOICES = (
+        ('PENDING', 'Pending Review'),
+        ('PROCESSING', 'Processing Transfer'),
+        ('PAID', 'Paid / Completed'),
+        ('REJECTED', 'Rejected'),
+    )
+    PAYOUT_METHOD_CHOICES = (
+        ('BANK_TRANSFER', 'Bank Transfer (NEFT/IMPS)'),
+        ('UPI', 'UPI Direct'),
+        ('STRIPE', 'Stripe Connect'),
+    )
+
+    seller = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='payouts'
+    )
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    payout_method = models.CharField(max_length=30, choices=PAYOUT_METHOD_CHOICES, default='BANK_TRANSFER')
+    account_details = models.TextField(help_text="Account number, IFSC, or UPI ID")
+    reference_id = models.CharField(max_length=100, blank=True, default='', help_text="Transaction reference / UTR / Transfer ID")
+    requested_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, default='')
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='decided_payouts'
+    )
+
+    class Meta:
+        ordering = ['-requested_at']
+
+    def __str__(self):
+        return f"Payout #{self.id} for {self.seller.name} - ₹{self.amount} ({self.status})"
+
+
+class SellerLedgerEntry(models.Model):
+    ENTRY_TYPES = (
+        ('SALE', 'Gross Order Sale'),
+        ('COMMISSION', 'Platform Commission Fee'),
+        ('REFUND', 'Customer Refund Deduction'),
+        ('PAYOUT', 'Payout Disbursement'),
+        ('ADJUSTMENT', 'Balance Adjustment'),
+    )
+
+    seller = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='ledger_entries'
+    )
+    entry_type = models.CharField(max_length=30, choices=ENTRY_TYPES)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    is_credit = models.BooleanField(help_text="True if adds to seller balance, False if deducts")
+    balance_after = models.DecimalField(max_digits=12, decimal_places=2, help_text="Running available balance after this entry")
+    order = models.ForeignKey(
+        Order,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='ledger_entries'
+    )
+    payout = models.ForeignKey(
+        SellerPayout,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='ledger_entries'
+    )
+    description = models.CharField(max_length=255)
+    reference_id = models.CharField(max_length=100, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        sign = '+' if self.is_credit else '-'
+        return f"Ledger #{self.id} [{self.seller.name}] {sign}₹{self.amount} ({self.entry_type}) -> Balance: ₹{self.balance_after}"
+
+    @classmethod
+    def get_seller_balance(cls, seller):
+        latest = cls.objects.filter(seller=seller).order_by('-created_at', '-id').first()
+        if latest:
+            return latest.balance_after
+        return Decimal('0.00')
+
+    @classmethod
+    def record(cls, seller, entry_type, amount, is_credit, description, order=None, payout=None, reference_id=''):
+        amount_dec = Decimal(str(amount))
+        current_balance = cls.get_seller_balance(seller)
+        new_balance = current_balance + amount_dec if is_credit else current_balance - amount_dec
+        return cls.objects.create(
+            seller=seller,
+            entry_type=entry_type,
+            amount=amount_dec,
+            is_credit=is_credit,
+            balance_after=new_balance,
+            order=order,
+            payout=payout,
+            description=description,
+            reference_id=reference_id
+        )
+
+
+class AdminAuditLog(models.Model):
+    ACTION_TYPES = (
+        ('PRODUCT_MODERATION', 'Product Moderation'),
+        ('SELLER_APPROVAL', 'Seller Approval & Status'),
+        ('COMMISSION_CHANGE', 'Commission Rate Change'),
+        ('DISPUTE_RESOLUTION', 'Dispute Resolution'),
+        ('PAYOUT_DECISION', 'Payout Decision'),
+        ('REFUND_DECISION', 'Refund & Return Decision'),
+        ('CATEGORY_MANAGEMENT', 'Category Management'),
+        ('OTHER', 'General Admin Action'),
+    )
+
+    admin = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='admin_audit_logs'
+    )
+    action_type = models.CharField(max_length=40, choices=ACTION_TYPES)
+    target_model = models.CharField(max_length=60)
+    target_id = models.CharField(max_length=100, blank=True, default='')
+    target_repr = models.CharField(max_length=255, blank=True, default='')
+    action_summary = models.CharField(max_length=255)
+    details = models.JSONField(default=dict, blank=True)
+    ip_address = models.CharField(max_length=45, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        admin_name = self.admin.name if self.admin else 'System'
+        return f"[{self.action_type}] {admin_name}: {self.action_summary} ({self.created_at.strftime('%Y-%m-%d %H:%M')})"
+
+    @classmethod
+    def log(cls, admin, action_type, target_model, target_id, action_summary, target_repr='', details=None, ip_address=''):
+        return cls.objects.create(
+            admin=admin if (admin and getattr(admin, 'is_authenticated', False)) else None,
+            action_type=action_type,
+            target_model=target_model,
+            target_id=str(target_id),
+            target_repr=target_repr,
+            action_summary=action_summary,
+            details=details or {},
+            ip_address=ip_address or ''
+        )
+
+
+class PlatformMonitoringLog(models.Model):
+    LOG_TYPES = (
+        ('PAYMENT_FAILURE', 'Payment Failure'),
+        ('WEBHOOK_ERROR', 'Stripe Webhook Error'),
+        ('GATEWAY_ANOMALY', 'Payment Gateway Anomaly'),
+        ('SYSTEM_ERROR', 'Platform System Error'),
+    )
+    SEVERITY_LEVELS = (
+        ('INFO', 'Informational'),
+        ('WARNING', 'Warning'),
+        ('ERROR', 'Error'),
+        ('CRITICAL', 'Critical Alert'),
+    )
+
+    log_type = models.CharField(max_length=30, choices=LOG_TYPES)
+    severity = models.CharField(max_length=20, choices=SEVERITY_LEVELS, default='ERROR')
+    source = models.CharField(max_length=100, help_text="e.g. Stripe Webhook, Payment Intent, Checkout Session")
+    event_id = models.CharField(max_length=150, blank=True, default='', help_text="Session ID, Event ID, or Gateway Intent ID")
+    order = models.ForeignKey(
+        Order,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='monitoring_logs'
+    )
+    customer_email = models.CharField(max_length=255, blank=True, default='')
+    error_message = models.TextField()
+    payload = models.JSONField(default=dict, blank=True)
+    is_resolved = models.BooleanField(default=False)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='resolved_monitoring_logs'
+    )
+    resolution_notes = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at', '-id']
+
+    def __str__(self):
+        return f"[{self.severity}] {self.log_type} from {self.source}: {self.error_message[:60]}"
+
+    @classmethod
+    def record(cls, log_type, severity, source, error_message, event_id='', order=None, customer_email='', payload=None):
+        return cls.objects.create(
+            log_type=log_type,
+            severity=severity,
+            source=source,
+            error_message=error_message,
+            event_id=str(event_id) if event_id else '',
+            order=order,
+            customer_email=customer_email or '',
+            payload=payload or {}
+        )

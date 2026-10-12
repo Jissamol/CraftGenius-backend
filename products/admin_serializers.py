@@ -3,7 +3,8 @@ from django.db import models as db_models
 from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, CommissionSetting, Dispute,
-    OrderTimeline, RefundRequest, PaymentReconciliation
+    OrderTimeline, RefundRequest, PaymentReconciliation,
+    AdminAuditLog, PlatformMonitoringLog
 )
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -228,3 +229,36 @@ class DisputeSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['raised_by', 'raised_by_name', 'created_at', 'updated_at']
+
+
+class AdminAuditLogSerializer(serializers.ModelSerializer):
+    admin_name = serializers.CharField(source='admin.name', read_only=True, default='System')
+    admin_email = serializers.CharField(source='admin.email', read_only=True, default='')
+    action_type_display = serializers.CharField(source='get_action_type_display', read_only=True)
+
+    class Meta:
+        model = AdminAuditLog
+        fields = [
+            'id', 'admin', 'admin_name', 'admin_email',
+            'action_type', 'action_type_display', 'target_model',
+            'target_id', 'target_repr', 'action_summary',
+            'details', 'ip_address', 'created_at'
+        ]
+
+
+class PlatformMonitoringLogSerializer(serializers.ModelSerializer):
+    log_type_display = serializers.CharField(source='get_log_type_display', read_only=True)
+    severity_display = serializers.CharField(source='get_severity_display', read_only=True)
+    order_id = serializers.IntegerField(source='order.id', read_only=True)
+    resolved_by_name = serializers.CharField(source='resolved_by.name', read_only=True, default='')
+
+    class Meta:
+        model = PlatformMonitoringLog
+        fields = [
+            'id', 'log_type', 'log_type_display',
+            'severity', 'severity_display', 'source',
+            'event_id', 'order', 'order_id', 'customer_email',
+            'error_message', 'payload', 'is_resolved',
+            'resolved_at', 'resolved_by', 'resolved_by_name',
+            'resolution_notes', 'created_at'
+        ]
