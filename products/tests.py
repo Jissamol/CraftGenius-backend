@@ -1,13 +1,17 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
 from django.contrib.auth import get_user_model
+from django.core import mail
+from django.test import override_settings
 from decimal import Decimal
 from products.models import (
     Category, Product, Order, OrderTimeline,
     RefundRequest, PaymentReconciliation, Earning,
     SellerPayout, SellerLedgerEntry,
-    AdminAuditLog, PlatformMonitoringLog, CommissionSetting
+    AdminAuditLog, PlatformMonitoringLog, CommissionSetting,
+    Notification, Wishlist, Cart, CartItem
 )
+from products.notifications import notify_product_stock_change, notify_user
 
 User = get_user_model()
 
@@ -421,3 +425,134 @@ class AdminAuditAndMonitoringTests(TestCase):
         logs = res_audit.json()['logs']
         self.assertTrue(any('Resolved monitoring incident' in r['action_summary'] for r in logs))
 
+
+class NotificationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email='notify-customer@example.com',
+            password='password123',
+            name='Notification Customer',
+            role='CUSTOMER'
+        )
+        self.seller = User.objects.create_user(
+            email='notify-seller@example.com',
+            password='password123',
+            name='Notification Seller',
+            role='HANDICRAFTER',
+            is_approved=True
+        )
+        self.admin = User.objects.create_user(
+            email='notify-admin@example.com',
+            password='password123',
+            name='Notification Admin',
+            role='ADMIN',
+            is_superuser=True
+        )
+        self.product = Product.objects.create(
+            name='Notification Product',
+            seller=self.seller,
+            price=Decimal('25.00'),
+            stock=0
+        )
+
+    def test_notifications_are_user_scoped_and_can_be_marked_read(self):
+        customer_notification = notify_user(
+            self.customer, 'ORDER', 'Order update', 'Your order changed.'
+        )
+        seller_notification = notify_user(
+            self.seller, 'LOW_STOCK', 'Low stock', 'Only 2 units remain.'
+        )
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get('/api/notifications/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['unread_count'], 1)
+        self.assertEqual(
+            [item['id'] for item in response.json()['notifications']],
+            [customer_notification.id]
+        )
+
+        response = self.client.patch(
+            f'/api/notifications/{customer_notification.id}/read/'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['is_read'])
+
+        response = self.client.patch(
+            f'/api/notifications/{seller_notification.id}/read/'
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_restock_and_low_stock_transitions_notify_right_people(self):
+        Wishlist.objects.create(user=self.customer, product=self.product)
+
+        self.product.stock = 3
+        notify_product_stock_change(self.product, previous_stock=0)
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer, notification_type='RESTOCK'
+        ).exists())
+        self.assertEqual(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).count(), 1)
+
+        self.product.stock = 5
+        notify_product_stock_change(self.product, previous_stock=8)
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).exists())
+
+        self.product.stock = 4
+        notify_product_stock_change(self.product, previous_stock=5)
+        self.assertEqual(
+            Notification.objects.filter(
+                user=self.seller, notification_type='LOW_STOCK'
+            ).count(),
+            2
+        )
+
+    def test_new_order_and_product_approval_events_are_wired(self):
+        self.product.stock = 6
+        self.product.save()
+        cart, _ = Cart.objects.get_or_create(user=self.customer)
+        CartItem.objects.create(cart=cart, product=self.product, quantity=2)
+
+        self.client.force_authenticate(self.customer)
+        response = self.client.post('/api/orders/create/', {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer, notification_type='ORDER'
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='NEW_ORDER'
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='LOW_STOCK'
+        ).exists())
+
+        self.product.is_approved = False
+        self.product.save()
+        self.client.force_authenticate(self.admin)
+        response = self.client.put(
+            f'/api/admin/products/{self.product.id}/approve/',
+            {},
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller, notification_type='PRODUCT_APPROVAL'
+        ).exists())
+
+    @override_settings(
+        EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+        DEFAULT_FROM_EMAIL='notifications@example.com'
+    )
+    def test_notification_email_is_sent_after_commit(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            notify_user(
+                self.customer, 'ORDER', 'Order confirmed', 'Your order is confirmed.'
+            )
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.customer.email])
+        self.assertIn('Your order is confirmed.', mail.outbox[0].body)

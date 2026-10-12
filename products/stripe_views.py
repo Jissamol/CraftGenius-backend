@@ -7,6 +7,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from .models import Product, Order, CommissionSetting, Earning, SellerLedgerEntry, PlatformMonitoringLog
 from .recommendation_engine import boost_category_interest
+from .notifications import (
+    notify_order_placed, notify_payment_confirmed, notify_product_stock_change
+)
 from decimal import Decimal
 import os
 
@@ -94,6 +97,7 @@ def create_checkout_session(request):
                 notes='Checkout session initiated. Awaiting payment.',
                 changed_by=request.user
             )
+            notify_order_placed(order)
             if product.category:
                 boost_category_interest(request.user, product.category, points=4.0)
         else:
@@ -117,6 +121,7 @@ def create_checkout_session(request):
                     notes='Checkout session initiated for cart item. Awaiting payment.',
                     changed_by=request.user
                 )
+                notify_order_placed(order)
                 if item.product.category:
                     boost_category_interest(request.user, item.product.category, points=4.0)
             # We DON'T clear the cart yet. We clear it in the webhook or on success page confirmation.
@@ -176,6 +181,9 @@ def stripe_webhook(request):
             orders = Order.objects.filter(stripe_session_id=session_id)
             
             for order in orders:
+                if order.is_paid:
+                    continue
+
                 order.is_paid = True
                 order.status = 'PROCESSING'
                 order.stripe_payment_intent = payment_intent
@@ -227,8 +235,11 @@ def stripe_webhook(request):
                 
                 # Reduce stock
                 product = order.product
+                previous_stock = product.stock
                 product.stock -= order.quantity
                 product.save()
+                notify_product_stock_change(product, previous_stock)
+                notify_payment_confirmed(order)
 
             # If it was a cart checkout, clear the cart
             if getattr(metadata, 'type', None) == 'cart':
@@ -312,6 +323,7 @@ def payment_success_view(request):
                         notes=f'Payment verified via Stripe Checkout session {session_id[:16]}... Order is now processing.',
                         changed_by=request.user
                     )
+                    notify_payment_confirmed(order)
                     
                     # Calculate and create Earning
                     commission_rate = CommissionSetting.get_rate()
@@ -352,8 +364,10 @@ def payment_success_view(request):
                     
                     # Stock reduction (atomicity check)
                     product = order.product
+                    previous_stock = product.stock
                     product.stock -= order.quantity
                     product.save()
+                    notify_product_stock_change(product, previous_stock)
                 
                 # Clear cart if it was a cart checkout
                 if getattr(session.metadata, 'type', None) == 'cart':

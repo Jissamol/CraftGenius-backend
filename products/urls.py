@@ -2,6 +2,11 @@ from django.urls import path
 from . import views, admin_views, stripe_views
 
 urlpatterns = [
+    # Notifications
+    path('notifications/', views.my_notifications, name='my-notifications'),
+    path('notifications/read-all/', views.mark_all_notifications_read, name='mark-all-notifications-read'),
+    path('notifications/<int:pk>/read/', views.mark_notification_read, name='mark-notification-read'),
+
     # ──────────── Stripe Endpoints ────────────
     path('stripe/create-session/', stripe_views.create_checkout_session, name='stripe-create-session'),
     path('stripe/webhook/', stripe_views.stripe_webhook, name='stripe-webhook'),

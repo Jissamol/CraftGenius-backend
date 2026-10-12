@@ -25,6 +25,9 @@ from .admin_serializers import (
     AdminRefundRequestSerializer, AdminAuditLogSerializer,
     PlatformMonitoringLogSerializer
 )
+from .notifications import (
+    notify_order_status, notify_product_approval, notify_refund
+)
 
 User = get_user_model()
 
@@ -295,8 +298,11 @@ def admin_products(request):
 def admin_approve_product(request, pk):
     try:
         product = Product.objects.get(id=pk)
+        was_approved = product.is_approved
         product.is_approved = True
         product.save()
+        if not was_approved:
+            notify_product_approval(product, approved=True)
 
         AdminAuditLog.log(
             admin=request.user,
@@ -320,8 +326,11 @@ def admin_approve_product(request, pk):
 def admin_reject_product(request, pk):
     try:
         product = Product.objects.get(id=pk)
+        was_approved = product.is_approved
         product.is_approved = False
         product.save()
+        if was_approved:
+            notify_product_approval(product, approved=False)
 
         AdminAuditLog.log(
             admin=request.user,
@@ -439,6 +448,8 @@ def admin_update_order_status(request, pk):
             notes=notes or f"Administrator updated order status from {old_status} to {new_status}.",
             changed_by=request.user
         )
+        if old_status != new_status:
+            notify_order_status(order)
 
         serializer = AdminOrderSerializer(order, context={'request': request})
         return Response(serializer.data)
@@ -521,6 +532,12 @@ def admin_refund_order(request, pk):
         title='Refund Processed & Reconciled',
         notes=f"Admin issued ₹{refund_amount} refund ({gateway_status}). Stock restored: {'Yes' if restore_stock else 'No'}. Notes: {admin_notes}",
         changed_by=request.user
+    )
+    notify_refund(
+        order.customer,
+        order,
+        f"Your refund of ₹{refund_amount} has been processed.",
+        title="Refund processed",
     )
 
     serializer = AdminOrderSerializer(order, context={'request': request})
@@ -644,6 +661,12 @@ def admin_decide_refund_request(request, pk):
             notes=f"Admin approved refund request of ₹{refund_amount} ({gateway_status}). Stock restored: {'Yes' if restore_stock else 'No'}. Notes: {admin_notes}",
             changed_by=request.user
         )
+        notify_refund(
+            refund_req.customer,
+            order,
+            f"Your refund request was approved and ₹{refund_amount} was refunded.",
+            title="Refund request approved",
+        )
 
         return Response({
             'detail': f'Refund request #{pk} approved. ₹{refund_amount} refunded.',
@@ -676,6 +699,12 @@ def admin_decide_refund_request(request, pk):
             title='Refund Request Rejected',
             notes=f"Admin rejected refund request: {admin_notes}",
             changed_by=request.user
+        )
+        notify_refund(
+            refund_req.customer,
+            order,
+            f"Your refund request was declined. Reason: {admin_notes}",
+            title="Refund request declined",
         )
 
         return Response({
@@ -1103,4 +1132,3 @@ def admin_resolve_monitoring_log(request, pk):
         'detail': f'Incident #{pk} marked as resolved.',
         'log': PlatformMonitoringLogSerializer(log_entry).data
     })
-

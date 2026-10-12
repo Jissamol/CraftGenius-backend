@@ -180,8 +180,11 @@ class Order(models.Model):
     def restore_stock(self):
         """Idempotently restore stock for the ordered product."""
         if not self.stock_restored:
+            previous_stock = self.product.stock
             self.product.stock += self.quantity
             self.product.save(update_fields=['stock'])
+            from .notifications import notify_product_stock_change
+            notify_product_stock_change(self.product, previous_stock)
             self.stock_restored = True
             self.save(update_fields=['stock_restored'])
             return True
@@ -481,6 +484,35 @@ class Wishlist(models.Model):
 
     def __str__(self):
         return f"{self.user.name} ♥ {self.product.name}"
+
+
+class Notification(models.Model):
+    TYPE_CHOICES = (
+        ('ORDER', 'Order'),
+        ('REFUND', 'Refund'),
+        ('RESTOCK', 'Restock'),
+        ('NEW_ORDER', 'New Order'),
+        ('LOW_STOCK', 'Low Stock'),
+        ('PRODUCT_APPROVAL', 'Product Approval'),
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notifications'
+    )
+    notification_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=150)
+    message = models.TextField()
+    url = models.CharField(max_length=255, blank=True, default='')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.title} for {self.user.email}"
 
 
 class CustomerProfile(models.Model):
@@ -836,5 +868,3 @@ class PlatformMonitoringLog(models.Model):
             customer_email=customer_email or '',
             payload=payload or {}
         )
-
-

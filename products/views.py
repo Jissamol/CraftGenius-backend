@@ -21,7 +21,7 @@ from .models import (
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
     CommissionSetting, ProductEmbedding, BrowsingHistory, UserCategoryInterest,
     OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto,
-    SellerPayout, SellerLedgerEntry
+    SellerPayout, SellerLedgerEntry, Notification
 )
 from .recommendation_engine import (
     RecommendationEngine, record_product_view, boost_category_interest
@@ -35,11 +35,46 @@ from .serializers import (
     ProductDetailSerializer, OrderTimelineSerializer, RefundRequestSerializer,
     PaymentReconciliationSerializer, WorkshopPhotoSerializer,
     ArtisanStorefrontSerializer, SellerLedgerEntrySerializer,
-    SellerPayoutSerializer
+    SellerPayoutSerializer, NotificationSerializer
+)
+from .notifications import (
+    notify_order_placed, notify_order_status, notify_product_stock_change,
+    notify_refund, notify_seller_new_order
 )
 
 
 # ──────────────────────────── Categories ────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def my_notifications(request):
+    notifications = Notification.objects.filter(user=request.user)
+    return Response({
+        'notifications': NotificationSerializer(notifications, many=True).data,
+        'unread_count': notifications.filter(is_read=False).count(),
+    })
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def mark_all_notifications_read(request):
+    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    return Response({'detail': 'All notifications marked as read.'})
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def mark_notification_read(request, pk):
+    try:
+        notification = Notification.objects.get(pk=pk, user=request.user)
+    except Notification.DoesNotExist:
+        return Response({'detail': 'Notification not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if not notification.is_read:
+        notification.is_read = True
+        notification.save(update_fields=['is_read'])
+    return Response(NotificationSerializer(notification).data)
+
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -109,7 +144,9 @@ def update_product(request, pk):
 
     serializer = ProductCreateSerializer(product, data=request.data, partial=True, context={'request': request})
     if serializer.is_valid():
+        previous_stock = product.stock
         product = serializer.save()
+        notify_product_stock_change(product, previous_stock)
 
         # Handle new image uploads
         images = request.FILES.getlist('images')
@@ -224,6 +261,8 @@ def update_order_status(request, pk):
             notes=timeline_notes,
             changed_by=request.user
         )
+        if old_status != new_status:
+            notify_order_status(order)
 
         result = OrderSerializer(order, context={'request': request})
         return Response(result.data)
@@ -903,8 +942,12 @@ def create_order(request):
             total_amount=item.line_total
         )
         # Reduce stock
+        previous_stock = item.product.stock
         item.product.stock -= item.quantity
         item.product.save()
+        notify_product_stock_change(item.product, previous_stock)
+        notify_order_placed(order)
+        notify_seller_new_order(order)
 
         # Add initial timeline
         order.add_timeline(
@@ -1014,6 +1057,15 @@ def cancel_order(request, pk):
         notes=f"Reason: {reason}. Product stock restored.",
         changed_by=request.user
     )
+    if order.status == 'REFUNDED':
+        notify_refund(
+            order.customer,
+            order,
+            "Your cancelled order has been refunded.",
+            title="Refund processed",
+        )
+    else:
+        notify_order_status(order)
 
     serializer = OrderSerializer(order, context={'request': request})
     return Response(serializer.data)
@@ -1075,6 +1127,12 @@ def request_refund(request, pk):
         title='Refund & Return Requested',
         notes=f"Reason: {refund_req.get_reason_display()}. Amount: ₹{amount}. Explanation: {explanation}",
         changed_by=request.user
+    )
+    notify_refund(
+        request.user,
+        order,
+        "Your refund request has been received and is awaiting review.",
+        title="Refund request received",
     )
 
     serializer = OrderSerializer(order, context={'request': request})
@@ -1458,5 +1516,3 @@ def chat_assistant(request):
 
     except Exception as e:
         return Response({'detail': f'Error generating response: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-

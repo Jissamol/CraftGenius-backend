@@ -3,7 +3,7 @@ from .models import (
     Category, Product, ProductImage, Order, Review,
     SellerProfile, Earning, Cart, CartItem, Wishlist, CustomerProfile,
     OrderTimeline, RefundRequest, PaymentReconciliation, WorkshopPhoto,
-    SellerPayout, SellerLedgerEntry
+    SellerPayout, SellerLedgerEntry, Notification
 )
 
 
@@ -12,6 +12,16 @@ class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = ['id', 'name', 'slug', 'image']
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = [
+            'id', 'notification_type', 'title', 'message', 'url',
+            'is_read', 'created_at'
+        ]
+        read_only_fields = fields
 
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -436,4 +446,3 @@ class SellerPayoutSerializer(serializers.ModelSerializer):
             'seller_name'
         ]
         read_only_fields = ['id', 'status', 'reference_id', 'requested_at', 'processed_at', 'seller_name']
-
