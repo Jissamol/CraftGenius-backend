@@ -98,7 +98,7 @@ def notify_order_placed(order):
     notify_user(
         order.customer,
         'ORDER',
-        f"Order #{order.pk} placed",
+        f"{order.product.name} placed",
         f"Your order for {order.product.name} has been received.",
         url="/customer/orders",
     )
@@ -108,7 +108,7 @@ def notify_payment_confirmed(order):
     notify_user(
         order.customer,
         'ORDER',
-        f"Order #{order.pk} confirmed",
+        f"{order.product.name} confirmed",
         f"Payment was confirmed for your order of {order.product.name}.",
         url="/customer/orders",
     )
@@ -121,7 +121,7 @@ def notify_seller_new_order(order):
         order.seller,
         'NEW_ORDER',
         "New order received",
-        f"Order #{order.pk}: {order.quantity} x {order.product.name}.",
+        f"{order.quantity} x {order.product.name}.",
         url="/handicrafter/orders",
     )
 
@@ -130,18 +130,20 @@ def notify_order_status(order):
     notify_user(
         order.customer,
         'ORDER',
-        f"Order #{order.pk} updated",
+        f"{order.product.name} updated",
         f"Your order for {order.product.name} is now {order.get_status_display().lower()}.",
         url="/customer/orders",
     )
 
 
 def notify_refund(user, order, message, title="Refund update"):
+    prefix = f"{order.product.name} - " if hasattr(order, 'product') and order.product else ""
+    full_title = f"{prefix}{title}" if not title.startswith(prefix) else title
     notify_user(
         user,
         'REFUND',
-        title,
-        f"Order #{order.pk}: {message}",
+        full_title,
+        message,
         url="/customer/orders",
     )
 
